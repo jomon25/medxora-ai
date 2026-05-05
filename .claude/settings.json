@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm create *)",
+      "Bash(venv/Scripts/python.exe -c \"import fastapi, sqlalchemy, pandas, numpy; print\\('All imports OK'\\)\")",
+      "Bash(venv/Scripts/python.exe -c ' *)",
+      "Bash(grep -E \"\\\\.db$\")",
+      "Bash(Get-ChildItem -Recurse -Force)",
+      "Bash(Select-Object FullName)"
+    ]
+  }
+}
