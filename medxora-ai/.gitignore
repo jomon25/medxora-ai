@@ -1,0 +1,43 @@
+# Secrets and local env
+.env
+.env.*
+!.env.example
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+backend/venv/
+.venv/
+venv/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Generated project artifacts
+generated_strategies/
+backtest_reports/
+mt5_workspace/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

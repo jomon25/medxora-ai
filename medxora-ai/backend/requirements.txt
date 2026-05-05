@@ -1,0 +1,15 @@
+fastapi[standard]
+uvicorn[standard]
+pydantic
+sqlalchemy
+pandas
+numpy
+python-dotenv
+requests
+jinja2
+google-generativeai
+beautifulsoup4
+lxml
+python-dateutil
+websockets
+pymongo[srv]
