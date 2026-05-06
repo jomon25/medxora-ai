@@ -5,14 +5,31 @@ Handles multi-step agent missions with human approval gates.
 """
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 from sqlalchemy.orm import Session
 
 from database.tables import (Mission, MissionStep, AgentReasoningLog, HumanApproval,
                               MCPEvent, StrategyMemory, ValidationReport, ExportedMql5,
-                              Strategy, BacktestResult)
+                              Strategy, BacktestResult, WalkForwardResult)
 from services.gemini_planner import (plan_mission, critique_strategy, explain_risk,
                                      advise_evolution, write_final_report)
 from services.logger import log_info, log_warn, log_error
+
+REAL_BACKTEST_TOOL_NAMES = {"backtest_mock", "backtest_real_data", "backtest_eurusd_tick"}
+MISSION_METRIC_KEYS = [
+    "net_profit",
+    "gross_profit",
+    "gross_loss",
+    "max_drawdown",
+    "win_rate",
+    "total_trades",
+    "profit_factor",
+    "expected_payoff",
+    "sharpe_ratio",
+    "recovery_factor",
+    "monthly_profit",
+    "yearly_profit",
+]
 
 
 # ── Mission lifecycle ──────────────────────────────────────────────────────────
@@ -30,13 +47,14 @@ def create_mission(db: Session, user_goal: str, pair: str = "EURUSD", timeframe:
     db.flush()
 
     for step_def in plan.get("steps", []):
+        normalized = _normalize_plan_step(step_def)
         step = MissionStep(
             mission_id=mission.id,
-            step_number=step_def.get("step_number", 0),
-            step_name=step_def.get("step_name", "Step"),
-            tool_name=step_def.get("tool_name"),
-            requires_approval=str(step_def.get("requires_approval", False)).lower(),
-            input_json=json.dumps({"description": step_def.get("description", "")}),
+            step_number=normalized.get("step_number", 0),
+            step_name=normalized.get("step_name", "Step"),
+            tool_name=normalized.get("tool_name"),
+            requires_approval=str(normalized.get("requires_approval", False)).lower(),
+            input_json=json.dumps({"description": normalized.get("description", "")}),
         )
         db.add(step)
 
@@ -67,6 +85,16 @@ def advance_mission(db: Session, mission_id: int) -> dict:
                      .order_by(MissionStep.step_number).all())
 
     if not pending_steps:
+        failed_count = (db.query(MissionStep)
+                        .filter(MissionStep.mission_id == mission_id,
+                                MissionStep.status == "failed")
+                        .count())
+        if failed_count > 0:
+            mission.status = "failed"
+            mission.completed_at = datetime.now(timezone.utc)
+            db.commit()
+            return {"status": "failed",
+                    "message": f"Mission failed: {failed_count} step(s) encountered errors"}
         mission.status = "completed"
         mission.completed_at = datetime.now(timezone.utc)
         db.commit()
@@ -119,6 +147,209 @@ def _execute_step(db: Session, mission: Mission, step: MissionStep):
 
 # ── State helpers ──────────────────────────────────────────────────────────────
 
+def _normalize_plan_step(step_def: dict) -> dict:
+    normalized = dict(step_def or {})
+    tool_name = normalized.get("tool_name")
+    step_name = normalized.get("step_name", "Step")
+    description = normalized.get("description", "")
+    if tool_name == "backtest_mock":
+        normalized["tool_name"] = "backtest_eurusd_tick"
+        normalized["step_name"] = (
+            step_name.replace("Mock", "Real Tick").replace("mock", "real tick")
+            if "mock" in step_name.lower()
+            else "Run EURUSD Real Tick Backtest"
+        )
+        normalized["description"] = description or "Backtest against EURUSD real tick-derived OHLCV data."
+    return normalized
+
+
+def _extract_metric_payload(payload: dict | None) -> dict | None:
+    payload = payload or {}
+    source = payload.get("latest_backtest") if isinstance(payload.get("latest_backtest"), dict) else payload
+    metrics = {key: source.get(key) for key in MISSION_METRIC_KEYS if source.get(key) is not None}
+    return metrics or None
+
+
+def _get_latest_backtest(db: Session, strategy_id: int | None) -> BacktestResult | None:
+    if not strategy_id:
+        return None
+    return (
+        db.query(BacktestResult)
+        .filter(BacktestResult.strategy_id == strategy_id)
+        .order_by(BacktestResult.created_at.desc())
+        .first()
+    )
+
+
+def _load_backtest_report_metadata(report_file: str | None) -> dict:
+    if not report_file:
+        return {}
+    path = Path(report_file)
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return {
+        "initial_balance": payload.get("initial_balance"),
+        "start_date": payload.get("start_date"),
+        "end_date": payload.get("end_date"),
+        "data_source": payload.get("data_source"),
+        "report_file": payload.get("report_file") or report_file,
+    }
+
+
+def _serialize_strategy_snapshot(strategy_row: Strategy | None, latest_backtest: BacktestResult | None = None) -> dict | None:
+    if not strategy_row:
+        return None
+    payload = strategy_row.as_dict()
+    metrics = latest_backtest.as_dict() if latest_backtest else None
+    if metrics and latest_backtest:
+        metrics.update(_load_backtest_report_metadata(latest_backtest.report_file))
+    payload["latest_backtest"] = metrics
+    if metrics:
+        for key in MISSION_METRIC_KEYS:
+            payload[key] = metrics.get(key)
+        payload["data_source"] = metrics.get("data_source", "EURUSD real tick-derived OHLCV")
+        payload["initial_balance"] = metrics.get("initial_balance")
+        payload["start_date"] = metrics.get("start_date")
+        payload["end_date"] = metrics.get("end_date")
+    payload["mql5_file"] = strategy_row.mql5_file
+    return payload
+
+
+def get_mission_strategy_snapshot(db: Session, mission: Mission) -> dict | None:
+    strategy_row = None
+
+    if mission.final_strategy_id:
+        strategy_row = db.query(Strategy).filter(Strategy.id == mission.final_strategy_id).first()
+
+    strategy_dict, metrics = _get_strategy_context(db, mission)
+    if not strategy_row and strategy_dict:
+        strategy_row = db.query(Strategy).filter(Strategy.name == strategy_dict.get("name")).first()
+
+    latest_backtest = _get_latest_backtest(db, strategy_row.id if strategy_row else None)
+    if strategy_row:
+        snapshot = _serialize_strategy_snapshot(strategy_row, latest_backtest)
+        if snapshot:
+            if not snapshot.get("latest_backtest") and metrics:
+                snapshot["latest_backtest"] = metrics
+                for key in MISSION_METRIC_KEYS:
+                    if metrics.get(key) is not None:
+                        snapshot[key] = metrics.get(key)
+            snapshot["mission_pair"] = mission.pair
+            snapshot["mission_timeframe"] = mission.timeframe
+            return snapshot
+
+    if not strategy_dict:
+        return None
+
+    snapshot = {
+        "id": None,
+        "name": strategy_dict.get("name"),
+        "symbol": strategy_dict.get("symbol", mission.pair),
+        "timeframe": strategy_dict.get("timeframe", mission.timeframe),
+        "strategy_type": strategy_dict.get("strategy_type", "strategy"),
+        "generation": strategy_dict.get("generation", 0),
+        "parameters": strategy_dict.get("parameters", {}),
+        "latest_backtest": metrics,
+        "mission_pair": mission.pair,
+        "mission_timeframe": mission.timeframe,
+    }
+    if metrics:
+        snapshot.update(metrics)
+        snapshot["data_source"] = metrics.get("data_source", "EURUSD real tick-derived OHLCV")
+    return snapshot
+
+
+def _ensure_real_tick_ohlcv(timeframe: str) -> str:
+    from services.mt5_ohlcv_generator import OUTPUT_DIR, generate_ohlcv_from_mt5_ticks
+    from services.mt5_tick_converter import PARQUET_PATH, convert_mt5_ticks_to_parquet
+
+    target_path = Path(OUTPUT_DIR) / f"EURUSD_{timeframe}.parquet"
+    if target_path.exists():
+        return str(target_path)
+
+    if not Path(PARQUET_PATH).exists():
+        convert_mt5_ticks_to_parquet()
+
+    generate_ohlcv_from_mt5_ticks()
+    if not target_path.exists():
+        raise FileNotFoundError(f"Real EURUSD OHLCV dataset is missing for {timeframe}.")
+
+    return str(target_path)
+
+
+def _run_real_backtest_for_strategy(db: Session, mission: Mission, strategy_dict: dict, strategy_row: Strategy | None = None) -> dict:
+    from services.backtest_engine import run_ema_backtest
+    from services.evolution_engine import score_result
+
+    params = strategy_dict.get("parameters", {})
+    timeframe = strategy_dict.get("timeframe", mission.timeframe)
+    _ensure_real_tick_ohlcv(timeframe)
+
+    raw_result = run_ema_backtest(
+        symbol="EURUSD",
+        timeframe=timeframe,
+        fast_ema=int(params.get("fast_ema", params.get("macd_fast", 14)) or 14),
+        slow_ema=int(params.get("slow_ema", params.get("macd_slow", 50)) or 50),
+        initial_balance=5000.0,
+    )
+    strategy_row = strategy_row or db.query(Strategy).filter(Strategy.name == strategy_dict["name"]).first()
+
+    metrics = {
+        "net_profit": raw_result.get("net_profit"),
+        "gross_profit": raw_result.get("gross_profit"),
+        "gross_loss": raw_result.get("gross_loss"),
+        "max_drawdown": raw_result.get("max_drawdown_pct"),
+        "win_rate": raw_result.get("win_rate"),
+        "total_trades": raw_result.get("total_trades"),
+        "profit_factor": raw_result.get("profit_factor"),
+        "expected_payoff": raw_result.get("expected_payoff"),
+        "sharpe_ratio": raw_result.get("sharpe_ratio"),
+        "recovery_factor": raw_result.get("recovery_factor"),
+        "monthly_profit": raw_result.get("monthly_profit"),
+        "yearly_profit": raw_result.get("yearly_profit"),
+    }
+
+    if strategy_row:
+        db.add(BacktestResult(
+            strategy_id=strategy_row.id,
+            net_profit=metrics["net_profit"],
+            gross_profit=metrics["gross_profit"],
+            gross_loss=metrics["gross_loss"],
+            max_drawdown=metrics["max_drawdown"],
+            win_rate=metrics["win_rate"],
+            total_trades=metrics["total_trades"],
+            profit_factor=metrics["profit_factor"],
+            expected_payoff=metrics["expected_payoff"],
+            sharpe_ratio=metrics["sharpe_ratio"],
+            recovery_factor=metrics["recovery_factor"],
+            monthly_profit=metrics["monthly_profit"],
+            yearly_profit=metrics["yearly_profit"],
+            report_file=raw_result.get("report_file"),
+            status="completed",
+        ))
+        db.commit()
+
+    return {
+        **metrics,
+        "strategy_id": strategy_row.id if strategy_row else None,
+        "fitness_score": score_result(metrics),
+        "backtest_mode": "real_tick_data",
+        "data_source": raw_result.get("data_source", "EURUSD real tick-derived OHLCV"),
+        "initial_balance": raw_result.get("initial_balance"),
+        "start_date": raw_result.get("start_date"),
+        "end_date": raw_result.get("end_date"),
+        "final_equity": raw_result.get("final_equity"),
+        "bars": raw_result.get("bars"),
+        "average_spread_pips": raw_result.get("average_spread_pips"),
+        "equity_curve": raw_result.get("equity_curve", []),
+        "report_file": raw_result.get("report_file"),
+    }
+
+
 def _get_strategy_context(db: Session, mission: Mission) -> tuple:
     """Retrieve current champion strategy dict and backtest metrics from completed step outputs."""
     strategy_dict = None
@@ -134,18 +365,31 @@ def _get_strategy_context(db: Session, mission: Mission) -> tuple:
         try:
             out = json.loads(step.output_json)
             # Full original strategy stored in generate_strategy output
-            if step.tool_name == "generate_strategy" and out.get("strategy_data"):
+            if out.get("strategy_data"):
                 strategy_dict = out["strategy_data"]
             # Evolution may produce a better champion — prefer it
-            if step.tool_name == "evolution_agent" and out.get("evolved_strategy"):
+            if out.get("evolved_strategy"):
                 strategy_dict = out["evolved_strategy"]
             # Backtest metrics
-            if step.tool_name == "backtest_mock" and out.get("win_rate") is not None:
-                metrics = {k: out.get(k) for k in
-                           ["net_profit", "win_rate", "max_drawdown", "profit_factor",
-                            "sharpe_ratio", "total_trades"]}
+            extracted = _extract_metric_payload(out)
+            if extracted:
+                metrics = extracted
         except Exception:
             pass
+
+    if mission.final_strategy_id:
+        final_row = db.query(Strategy).filter(Strategy.id == mission.final_strategy_id).first()
+        if final_row:
+            strategy_dict = final_row.as_dict()
+            latest_backtest = _get_latest_backtest(db, final_row.id)
+            if latest_backtest:
+                metrics = _extract_metric_payload(latest_backtest.as_dict()) or metrics
+
+    if strategy_dict and not metrics:
+        strategy_row = db.query(Strategy).filter(Strategy.name == strategy_dict.get("name")).first()
+        latest_backtest = _get_latest_backtest(db, strategy_row.id if strategy_row else None)
+        if latest_backtest:
+            metrics = _extract_metric_payload(latest_backtest.as_dict())
 
     return strategy_dict, metrics
 
@@ -155,6 +399,10 @@ def _save_strategy_to_db(db: Session, strategy: dict,
     """Upsert a strategy dict into the strategies table."""
     existing = db.query(Strategy).filter(Strategy.name == strategy["name"]).first()
     if existing:
+        # Update parameters_json if the existing row is missing it
+        if not existing.parameters_json:
+            existing.parameters_json = json.dumps(strategy.get("parameters", {}))
+            db.commit()
         return existing
     p = strategy.get("parameters", {})
     s = Strategy(
@@ -170,6 +418,7 @@ def _save_strategy_to_db(db: Session, strategy: dict,
         stop_loss=p.get("stop_loss", 300),
         take_profit=p.get("take_profit", 600),
         risk_percent=p.get("risk_percent", 1.0),
+        parameters_json=json.dumps(strategy.get("parameters", {})),  # full params preserved
         parent_id=parent_id,
         generation=generation,
     )
@@ -199,11 +448,16 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
         from agents.strategy_creator import generate_strategy
         from services.mql5_generator import generate_mql5
 
-        strategy = generate_strategy(timeframe=mission.timeframe, strategy_type="ema_rsi")
+        strategy = generate_strategy(
+            timeframe=mission.timeframe,
+            strategy_type="ema_rsi",
+            mission_brief=mission.user_goal,
+        )
         file_path = generate_mql5(strategy)
 
         s = _save_strategy_to_db(db, strategy)
         s.mql5_file = file_path
+        mission.final_strategy_id = s.id
         db.commit()
 
         critique = critique_strategy(strategy)
@@ -218,10 +472,12 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
 
         return {
             "summary": (f"Generated {strategy['strategy_type']} strategy {strategy['name']} "
-                        f"for {mission.pair}. Gemini verdict: {critique.get('verdict', 'needs_improvement')}."),
+                        f"for {mission.pair} using {strategy.get('generation_source', 'mission pipeline')}. "
+                        f"Gemini verdict: {critique.get('verdict', 'needs_improvement')}."),
             "strategy_name": strategy["name"],
             "strategy_id": s.id,
             "strategy_data": strategy,           # full dict for downstream steps
+            "strategy_generation_source": strategy.get("generation_source"),
             "file": file_path,
             "gemini_critique": critique,
             "decision": "proceed", "next_action": "validate_risk", "confidence": 0.9,
@@ -235,12 +491,12 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
         if not strategy_dict:
             return {"summary": "No strategy found to validate.", "decision": "retry", "confidence": 0.3}
 
-        risk_result = check_risk(strategy_dict)
+        risk_result = check_risk(strategy_dict, db=db)
         explanation = explain_risk(strategy_dict, risk_result)
 
         db.add(AgentReasoningLog(
             mission_id=mission.id, agent_name="Gemini Risk Explainer",
-            reasoning_summary=explanation,
+            reasoning_summary=explanation.get("summary", "Risk explanation generated."),
             decision="proceed" if risk_result["passed"] else "mutate",
             next_action="mql5_generator", confidence=0.85,
         ))
@@ -248,7 +504,7 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
 
         status = "PASSED" if risk_result["passed"] else "needs adjustment"
         return {
-            "summary": f"Risk validation {status}. {explanation[:120]}",
+            "summary": f"Risk validation {status}. {explanation.get('summary', '')[:120]}",
             "passed": risk_result["passed"],
             "issues": risk_result.get("issues", []),
             "warnings": risk_result.get("warnings", []),
@@ -272,53 +528,39 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
 
         return {
             "summary": f"MQL5 Expert Advisor code generated: {strategy_dict['name']}.mq5",
-            "file": file_path, "decision": "proceed", "next_action": "backtest_mock", "confidence": 1.0,
+            "file": file_path, "decision": "proceed", "next_action": "backtest_eurusd_tick", "confidence": 1.0,
         }
 
     # ── 5. Backtest (mock) ───────────────────────────────────────────────────
-    if tool_name == "backtest_mock":
-        from services.report_parser import parse_mock_result
-        from services.evolution_engine import score_result
-
+    if tool_name in REAL_BACKTEST_TOOL_NAMES:
         strategy_dict, _ = _get_strategy_context(db, mission)
         if not strategy_dict:
             return {"summary": "No strategy to backtest.", "decision": "retry", "confidence": 0.3}
 
-        metrics = parse_mock_result(strategy_dict["name"])
-        fitness = score_result(metrics)
-
         s = db.query(Strategy).filter(Strategy.name == strategy_dict["name"]).first()
-        if s:
-            db.add(BacktestResult(
-                strategy_id=s.id,
-                net_profit=metrics.get("net_profit"),
-                gross_profit=metrics.get("gross_profit"),
-                gross_loss=metrics.get("gross_loss"),
-                max_drawdown=metrics.get("max_drawdown"),
-                win_rate=metrics.get("win_rate"),
-                total_trades=metrics.get("total_trades"),
-                profit_factor=metrics.get("profit_factor"),
-                expected_payoff=metrics.get("expected_payoff"),
-                sharpe_ratio=metrics.get("sharpe_ratio"),
-                recovery_factor=metrics.get("recovery_factor"),
-                monthly_profit=metrics.get("monthly_profit"),
-                yearly_profit=metrics.get("yearly_profit"),
-                status="completed",
-            ))
-            db.commit()
+        metrics = _run_real_backtest_for_strategy(db, mission, strategy_dict, strategy_row=s)
 
         return {
-            "summary": (f"Backtest complete for {strategy_dict['name']}. "
-                        f"Net profit: ${metrics['net_profit']:.0f}, "
-                        f"Win rate: {metrics['win_rate']:.1f}%, "
-                        f"Sharpe: {metrics['sharpe_ratio']:.2f}"),
+            "summary": (f"EURUSD real tick backtest complete for {strategy_dict['name']}. "
+                        f"Net profit: ${float(metrics['net_profit'] or 0):.0f}, "
+                        f"Win rate: {float(metrics['win_rate'] or 0):.1f}%, "
+                        f"Sharpe: {float(metrics['sharpe_ratio'] or 0):.2f}"),
             "net_profit": metrics["net_profit"],
+            "gross_profit": metrics["gross_profit"],
+            "gross_loss": metrics["gross_loss"],
             "win_rate": metrics["win_rate"],
             "max_drawdown": metrics["max_drawdown"],
             "profit_factor": metrics["profit_factor"],
+            "expected_payoff": metrics["expected_payoff"],
             "sharpe_ratio": metrics["sharpe_ratio"],
+            "recovery_factor": metrics["recovery_factor"],
+            "monthly_profit": metrics["monthly_profit"],
+            "yearly_profit": metrics["yearly_profit"],
             "total_trades": metrics["total_trades"],
-            "fitness_score": fitness,
+            "strategy_id": metrics["strategy_id"],
+            "fitness_score": metrics["fitness_score"],
+            "latest_backtest": metrics,
+            "data_source": metrics["data_source"],
             "decision": "proceed", "next_action": "report_parser", "confidence": 0.8,
         }
 
@@ -387,8 +629,51 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
             "evidence": mc["evidence"],
             "ruin_probability": data.get("ruin_probability"),
             "expected_return_pct": data.get("expected_return_pct"),
-            "next_action": "evolution_agent",
+            "next_action": "walk_forward_agent",
             "confidence": mc["confidence"],
+        }
+
+    # -- 8.5 Walk-Forward Validation ---------------------------------------------------
+    if tool_name == "walk_forward_agent":
+        from services.agent_orchestrator import _run_walk_forward_agent
+
+        strategy_dict, metrics = _get_strategy_context(db, mission)
+        if not strategy_dict:
+            return {"summary": "No strategy for walk-forward validation.", "decision": "retry", "confidence": 0.4}
+
+        wf = _run_walk_forward_agent(strategy_dict, metrics)
+        data = wf.get("data", {})
+        s = db.query(Strategy).filter(Strategy.name == strategy_dict["name"]).first()
+        if s:
+            db.add(WalkForwardResult(
+                strategy_id=s.id,
+                windows_json=json.dumps(data.get("windows", [])),
+                consistency_score=float(data.get("consistency_score", 0) or 0),
+                is_avg_profit=float(sum(w.get("in_sample_pf", 0) for w in data.get("windows", [])) / max(len(data.get("windows", [])), 1)),
+                oos_avg_profit=float(data.get("average_out_of_sample_pf", 0) or 0),
+                degradation_pct=float(data.get("degradation_pct", 0) or 0),
+                passed=str(wf.get("decision") in ("approve", "needs_retest")).lower(),
+            ))
+            db.add(ValidationReport(
+                strategy_id=s.id,
+                validation_type="walk_forward",
+                robustness_score=float(data.get("consistency_score", 0) or 0),
+                risk_score=float(max(0.0, 100.0 - float(data.get("degradation_pct", 0) or 0))),
+                passed=str(wf.get("decision") in ("approve", "needs_retest")).lower(),
+                summary=wf.get("reason"),
+                details_json=json.dumps(data),
+            ))
+            db.commit()
+
+        return {
+            "summary": wf["reason"],
+            "decision": "proceed",
+            "walk_forward_decision": wf["decision"],
+            "consistency_score": data.get("consistency_score"),
+            "degradation_pct": data.get("degradation_pct"),
+            "windows": data.get("windows", []),
+            "next_action": "evolution_agent",
+            "confidence": wf["confidence"],
         }
 
     # ── 9. Evolution Agent ───────────────────────────────────────────────────
@@ -404,6 +689,7 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
         best = evo["evolved"]
         child_scores = [g["best_score"] for g in evo["generations"]]
         advice = advise_evolution(strategy_dict, child_scores, generation=3)
+        backtest_metrics = None
 
         if evo["improved"]:
             s_parent = db.query(Strategy).filter(Strategy.name == strategy_dict["name"]).first()
@@ -418,25 +704,30 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
                 db.commit()
             except Exception:
                 pass
+            try:
+                backtest_metrics = _run_real_backtest_for_strategy(db, mission, best, strategy_row=s_child)
+            except Exception as backtest_error:
+                log_error("mission_service", f"Evolution backtest failed for {best.get('name')}: {backtest_error}")
             mission.final_strategy_id = s_child.id
             db.commit()
 
         db.add(AgentReasoningLog(
             mission_id=mission.id, agent_name="Gemini Evolution Advisor",
-            reasoning_summary=advice,
+            reasoning_summary=advice.get("summary", "Evolution advice generated."),
             decision="proceed", next_action="mcp_search", confidence=0.85,
         ))
         db.commit()
 
         return {
             "summary": (f"Evolution over 3 generations. Champion: {best['name']}. "
-                        f"Improved: {evo['improved']}. Gemini: {advice[:80]}"),
+                        f"Improved: {evo['improved']}. Gemini: {advice.get('summary', '')[:80]}"),
             "decision": "proceed",
             "generations": 3,
             "improved": evo["improved"],
             "champion_name": best["name"],
             "evolved_strategy": best,           # full dict so downstream steps can use it
             "best_score": evo["best_score"],
+            "latest_backtest": backtest_metrics if evo["improved"] else None,
             "gemini_advice": advice,
             "next_action": "mcp_search", "confidence": 0.85,
         }
@@ -471,6 +762,13 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
         from agents.ensemble_voting_agent import run_ensemble_voting_agent
         from agents.risk_manager import check_risk
         from agents.monte_carlo_agent import run_monte_carlo_agent
+        from agents.sentiment_agent import run_sentiment_agent
+        from agents.macro_calendar_agent import run_macro_calendar_agent
+        from agents.seasonality_agent import run_seasonality_agent
+        from agents.regime_change_detector_agent import run_regime_change_detector_agent
+        from agents.drawdown_recovery_agent import run_drawdown_recovery_agent
+        from agents.slippage_spread_agent import run_slippage_spread_agent
+        from agents.benchmark_comparison_agent import run_benchmark_comparison_agent
 
         strategy_dict, metrics = _get_strategy_context(db, mission)
         if not strategy_dict:
@@ -506,6 +804,31 @@ def _run_tool(db: Session, tool_name: str, mission: Mission, step: MissionStep) 
                 "confidence": 0.80,
                 "risk_level": "medium",
             },
+        ]
+
+        # ── Wire in the 12 intelligence agents ──────────────────────────────
+        def _safe_agent(name, fn, *args):
+            """Call an intelligence agent; on error return a neutral needs_retest."""
+            try:
+                result = fn(*args)
+                return {
+                    "agent": name,
+                    "decision": result.get("decision", "needs_retest"),
+                    "confidence": float(result.get("confidence", 0.60)),
+                    "risk_level": result.get("risk_level", "medium"),
+                }
+            except Exception:
+                return {"agent": name, "decision": "needs_retest",
+                        "confidence": 0.50, "risk_level": "medium"}
+
+        agent_decisions += [
+            _safe_agent("Sentiment Analysis Agent",      run_sentiment_agent,              strategy_dict, metrics),
+            _safe_agent("Macro Calendar Agent",          run_macro_calendar_agent,         strategy_dict, metrics),
+            _safe_agent("Seasonality Agent",             run_seasonality_agent,            strategy_dict, metrics),
+            _safe_agent("Regime Change Detector",        run_regime_change_detector_agent, strategy_dict, metrics),
+            _safe_agent("Drawdown Recovery Agent",       run_drawdown_recovery_agent,      strategy_dict, metrics),
+            _safe_agent("Slippage & Spread Agent",       run_slippage_spread_agent,        strategy_dict, metrics),
+            _safe_agent("Benchmark Comparison Agent",    run_benchmark_comparison_agent,   strategy_dict, metrics),
         ]
 
         result = run_ensemble_voting_agent(agent_decisions)

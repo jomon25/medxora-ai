@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 sqlalchemy
 pandas
+pyarrow
 numpy
 python-dotenv
 requests

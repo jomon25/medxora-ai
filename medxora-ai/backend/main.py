@@ -31,6 +31,8 @@ Phase 15 : GET  /api/logs
 
 import json
 import os
+import urllib.error
+import urllib.request
 
 from fastapi import FastAPI, Depends, HTTPException, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,13 +43,16 @@ from sqlalchemy.orm import Session
 
 from database.db     import get_db, init_db
 from database.tables import (
+    AgentCalibration,
     AgentMemory,
     BacktestResult,
+    DebateRecord,
     EvolutionLesson,
     FailedStrategyReason,
     PipelineCheckpoint,
     Strategy,
     StrategyReflection,
+    WalkForwardResult,
 )
 from database.tables import (Mission, MissionStep, AgentReasoningLog, HumanApproval, MCPEvent, StrategyMemory, ValidationReport, ExportedMql5)
 
@@ -60,6 +65,7 @@ from agents.overfitting_detector     import run_overfitting_detector
 from agents.monte_carlo_agent        import run_monte_carlo_agent
 from agents.session_performance_agent import run_session_performance_agent
 from agents.correlation_guard_agent  import run_correlation_guard_agent
+from agents.debate_agent             import run_debate_agent
 from agents.ensemble_voting_agent    import run_ensemble_voting_agent
 from agents.adaptive_risk_agent      import run_adaptive_risk_agent
 from agents.sentiment_agent          import run_sentiment_agent
@@ -73,6 +79,9 @@ from agents.strategy_retirement_agent import run_strategy_retirement_agent
 from agents.portfolio_rebalancer_agent import run_portfolio_rebalancer_agent
 from agents.alert_notification_agent  import run_alert_notification_agent
 from agents.benchmark_comparison_agent import run_benchmark_comparison_agent
+from agents.multi_timeframe_agent    import run_multi_timeframe_agent
+from agents.news_sentiment_nlp_agent import run_news_sentiment_nlp_agent
+from agents.regime_adaptive_agent    import run_regime_adaptive_parameter_agent
 from services.agent_orchestrator     import get_orchestrator
 
 from services.mql5_generator      import generate_mql5
@@ -87,6 +96,12 @@ from services.gemini_service       import analyze_strategy, suggest_improvement
 from services.logger               import log_info, log_warn, log_error, get_logs
 from services.live_pipeline        import run_live_pipeline, resume_live_pipeline
 from services.memory_store         import store_evolution_lesson
+from services.integration_settings import (
+    get_configured_api_keys,
+    get_configured_local_models,
+    get_integration_settings_payload,
+    save_integration_settings,
+)
 from services.parallel_mt5_runner  import run_parallel_backtests
 from services.pipeline_checkpoints import latest_checkpoint, list_checkpoints
 from services.pipeline_ws          import manager
@@ -96,11 +111,25 @@ from services.tick_data_inspector  import inspect_tick_data_file
 from services.walk_forward         import generate_walk_forward_windows, walk_forward_score
 from services.timeframes           import ALLOWED_TIMEFRAMES, normalize_timeframe
 from services.win_rate_optimizer   import optimize_win_rate
+from services.mt5_tick_converter   import (
+    PARQUET_PATH as DATASET_PARQUET_PATH,
+    RAW_PATH as DATASET_RAW_PATH,
+    convert_mt5_ticks_to_parquet,
+    get_conversion_metadata,
+)
+from services.mt5_ohlcv_generator  import (
+    OUTPUT_DIR as DATASET_OHLCV_DIR,
+    TIMEFRAMES as DATASET_TIMEFRAMES,
+    generate_ohlcv_from_mt5_ticks,
+    get_ohlcv_summary,
+)
+from services.backtest_engine      import get_latest_backtest_result, run_ema_backtest
 from services.gemini_planner import plan_mission, critique_strategy, explain_risk, advise_evolution, write_final_report, route_tool
-from services.mission_service import (create_mission, get_mission, list_missions, advance_mission, approve_step as approve_mission_step, pause_mission, resume_mission, stop_mission, get_reasoning_trace, run_full_demo_mission)
+from services.mission_service import (create_mission, get_mission, list_missions, advance_mission, approve_step as approve_mission_step, pause_mission, resume_mission, stop_mission, get_reasoning_trace, get_mission_strategy_snapshot, run_full_demo_mission)
 from services.mcp_service import save_strategy_memory, search_strategies as mcp_search_strategies, save_agent_log, observe_mission, get_mcp_status
 
 from config import (
+    BACKTEST_RESULTS_DIR,
     CORS_ALLOWED_ORIGINS,
     DATABASE_URL,
     GEMINI_API_KEY,
@@ -124,6 +153,14 @@ class MissionApproveRequest(BaseModel):
     approved: bool
     notes: str = ""
 
+class IntegrationKeyRequest(BaseModel):
+    name: str
+    value: str
+
+class IntegrationSettingsRequest(BaseModel):
+    api_keys: list[IntegrationKeyRequest] = []
+    local_models: list[str] = []
+
 class MCPSaveRequest(BaseModel):
     strategy_name: str
     pair: str = "EURUSD"
@@ -141,6 +178,133 @@ class MCPSearchRequest(BaseModel):
     min_sharpe: float | None = None
     max_drawdown: float | None = None
     risk_status: str | None = None
+
+
+class DatasetBacktestRequest(BaseModel):
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    fast_ema: int = 20
+    slow_ema: int = 50
+    start_date: str | None = "2020-01-02"
+    end_date: str | None = "2020-02-01"
+    initial_balance: float = 10000.0
+
+
+def _fallback_evolution_advice_payload(parent: dict, child_scores: list[float], generation: int) -> dict:
+    return {
+        "summary": (
+            f"Generation {generation} suggests tightening RSI thresholds and widening the EMA gap "
+            "to reduce whipsaws before the next evolution pass."
+        ),
+        "priority": "high" if child_scores and max(child_scores) < 350 else "medium",
+        "mutation_targets": [
+            {"parameter": "slow_ema", "direction": "increase", "reason": "Wider separation may improve trend quality."},
+            {"parameter": "rsi_buy", "direction": "decrease", "reason": "Slightly earlier entries can improve opportunity capture."},
+        ],
+        "expected_outcome": "Improve robustness and reduce overfitting risk in the next generation.",
+    }
+
+
+def _evolution_advice_prompt(parent: dict, child_scores: list[float], generation: int) -> str:
+    return f"""You are a genetic algorithm advisor for trading strategies.
+Parent strategy gen {generation}: {parent.get('name')}
+Child scores: {child_scores}
+Focus on SL/TP ratio, EMA gap, and RSI thresholds.
+
+Return ONLY valid JSON:
+{{"summary":"string","priority":"low|medium|high","mutation_targets":[{{"parameter":"fast_ema","direction":"increase|decrease|hold","reason":"string"}}],"expected_outcome":"string"}}"""
+
+
+def _parse_json_payload(raw: str, fallback: dict) -> dict:
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+
+    stripped = str(raw or "").replace("```json", "").replace("```", "").strip()
+    try:
+        return json.loads(stripped)
+    except Exception:
+        pass
+
+    depth = 0
+    start = -1
+    for index, ch in enumerate(str(raw or "")):
+        if ch == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0 and start != -1:
+                try:
+                    return json.loads(raw[start:index + 1])
+                except Exception:
+                    start = -1
+    return fallback
+
+
+def _evaluate_evolution_with_saved_integrations(parent: dict, child_scores: list[float], generation: int) -> tuple[dict, dict]:
+    fallback = _fallback_evolution_advice_payload(parent, child_scores, generation)
+    prompt = _evolution_advice_prompt(parent, child_scores, generation)
+    attempts: list[dict] = []
+
+    api_keys = get_configured_api_keys()
+    for index, entry in enumerate(api_keys, start=1):
+        api_key = entry.get("value", "").strip()
+        display_name = entry.get("name") or f"API Key {index}"
+        if not api_key:
+            continue
+        try:
+            import google.generativeai as genai
+
+            genai.configure(api_key=api_key)
+            model = genai.GenerativeModel("gemini-1.5-flash")
+            response = model.generate_content(prompt, request_options={"timeout": 30})
+            advice = _parse_json_payload(getattr(response, "text", "") or "", fallback)
+            log_info("evolution_agent", f"Evolution evaluation used saved API key '{display_name}' for {parent.get('name')}")
+            return advice, {
+                "provider": "gemini_api",
+                "target": display_name,
+                "attempts": attempts + [{"provider": "gemini_api", "target": display_name, "status": "success"}],
+            }
+        except Exception as exc:
+            attempts.append({"provider": "gemini_api", "target": display_name, "status": "failed", "detail": str(exc)})
+            log_warn("evolution_agent", f"Saved API key '{display_name}' failed during evolution evaluation: {exc}")
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    for model_name in get_configured_local_models():
+        try:
+            request = urllib.request.Request(
+                f"{base_url}/api/generate",
+                data=json.dumps({
+                    "model": model_name,
+                    "prompt": prompt,
+                    "stream": False,
+                }).encode("utf-8"),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=30) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            advice = _parse_json_payload(str(payload.get("response", "")).strip(), fallback)
+            log_info("evolution_agent", f"Evolution evaluation used saved local model '{model_name}' for {parent.get('name')}")
+            return advice, {
+                "provider": "local_model",
+                "target": model_name,
+                "attempts": attempts + [{"provider": "local_model", "target": model_name, "status": "success"}],
+            }
+        except Exception as exc:
+            attempts.append({"provider": "local_model", "target": model_name, "status": "failed", "detail": str(exc)})
+            log_warn("evolution_agent", f"Saved local model '{model_name}' failed during evolution evaluation: {exc}")
+
+    advice = advise_evolution(parent, child_scores, generation)
+    log_info("evolution_agent", f"Evolution evaluation fell back to Mission Control advice for {parent.get('name')}")
+    return advice, {
+        "provider": "mission_control_fallback",
+        "target": "Mission Control",
+        "attempts": attempts + [{"provider": "mission_control_fallback", "target": "Mission Control", "status": "success"}],
+    }
 
 
 def _db_strategy_kwargs(strategy: dict, file_path: str | None = None) -> dict:
@@ -192,6 +356,47 @@ def home():
     return {"message": "MedXora AI backend running", "version": "2.0.0"}
 
 
+def _local_model_status() -> dict:
+    model_names = get_configured_local_models()
+    if not model_names:
+        return {
+            "status": "missing",
+            "detail": "No local models configured.",
+            "models": [],
+        }
+
+    base_url = os.getenv("OLLAMA_BASE_URL", "http://127.0.0.1:11434").rstrip("/")
+    try:
+        request = urllib.request.Request(f"{base_url}/api/tags", method="GET")
+        with urllib.request.urlopen(request, timeout=5) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        available = {
+            str(item.get("name", "")).split(":")[0]
+            for item in payload.get("models", [])
+            if isinstance(item, dict)
+        }
+        ready_models = [name for name in model_names if name in available]
+        if ready_models:
+            status = "ready" if len(ready_models) == len(model_names) else "partial"
+            detail = f"Available locally: {', '.join(ready_models)}"
+        else:
+            status = "offline"
+            detail = f"Ollama responded, but configured models were not found: {', '.join(model_names)}"
+        return {
+            "status": status,
+            "detail": detail,
+            "models": model_names,
+            "url": base_url,
+        }
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        return {
+            "status": "offline",
+            "detail": f"Local model service unavailable: {exc}",
+            "models": model_names,
+            "url": base_url,
+        }
+
+
 @app.get("/api/health")
 def health_check(db: Session = Depends(get_db)):
     db_connected = True
@@ -208,7 +413,8 @@ def health_check(db: Session = Depends(get_db)):
 
     mt5_installed = os.path.exists(MT5_PATH)
     mt5_data_dir = _find_mt5_data_dir()
-    gemini_configured = bool(GEMINI_API_KEY.strip())
+    configured_api_keys = get_configured_api_keys()
+    local_model_status = _local_model_status()
     tick_data = inspect_tick_data_file(MT5_TICK_DATA_PATH)
 
     services = {
@@ -230,8 +436,17 @@ def health_check(db: Session = Depends(get_db)):
             "detail": mt5_data_dir or "MT5 data directory not detected",
         },
         "gemini": {
-            "status": "configured" if gemini_configured else "missing",
-            "detail": "Gemini API key present" if gemini_configured else "GEMINI_API_KEY not set",
+            "status": "configured" if configured_api_keys else "missing",
+            "detail": (
+                f"{len(configured_api_keys)} API key(s) ready for Mission Control"
+                if configured_api_keys
+                else "No API keys configured"
+            ),
+        },
+        "local_model": {
+            "status": local_model_status["status"],
+            "detail": local_model_status["detail"],
+            "models": local_model_status.get("models", []),
         },
         "mock_mode": {
             "status": "enabled",
@@ -251,6 +466,132 @@ def health_check(db: Session = Depends(get_db)):
 
     overall = "healthy" if db_connected else "degraded"
     return {"status": overall, "services": services}
+
+
+def _dataset_status_payload() -> dict:
+    raw_file = inspect_tick_data_file(str(DATASET_RAW_PATH))
+    conversion_metadata = get_conversion_metadata()
+    ohlcv_summary = get_ohlcv_summary()
+    latest_backtest = get_latest_backtest_result()
+
+    parquet_status = {
+        "status": "ready" if DATASET_PARQUET_PATH.exists() else "missing",
+        "path": str(DATASET_PARQUET_PATH),
+        "metadata": conversion_metadata,
+    }
+
+    ohlcv_files = []
+    summary_map = {
+        item.get("timeframe"): item
+        for item in ohlcv_summary.get("files", [])
+        if isinstance(item, dict)
+    }
+    for label in DATASET_TIMEFRAMES:
+        path = DATASET_OHLCV_DIR / f"EURUSD_{label}.parquet"
+        summary_item = summary_map.get(label, {})
+        ohlcv_files.append(
+            {
+                "timeframe": label,
+                "status": "ready" if path.exists() else "missing",
+                "file": str(path),
+                "rows": summary_item.get("rows"),
+                "start_date": summary_item.get("start_date"),
+                "end_date": summary_item.get("end_date"),
+                "avg_spread": summary_item.get("avg_spread"),
+            }
+        )
+
+    return {
+        "raw_file": raw_file,
+        "parquet": parquet_status,
+        "ohlcv": {
+            "status": "ready" if any(item["status"] == "ready" for item in ohlcv_files) else "missing",
+            "files": ohlcv_files,
+        },
+        "latest_backtest": latest_backtest,
+        "backtest_results_dir": BACKTEST_RESULTS_DIR,
+    }
+
+
+@app.get("/api/datasets/status")
+def dataset_status():
+    return _dataset_status_payload()
+
+
+@app.get("/api/integrations/settings")
+def get_integration_settings():
+    return get_integration_settings_payload(include_secret_values=False)
+
+
+@app.post("/api/integrations/settings")
+def update_integration_settings(req: IntegrationSettingsRequest):
+    payload = save_integration_settings(
+        api_keys=[item.dict() for item in req.api_keys],
+        local_models=req.local_models,
+    )
+    return {
+        "status": "saved",
+        "settings": payload,
+    }
+
+
+@app.post("/api/datasets/convert-mt5-eurusd")
+def convert_mt5_eurusd_dataset():
+    try:
+        result = convert_mt5_ticks_to_parquet()
+        return {
+            "message": "EURUSD MT5 tick dataset converted to Parquet",
+            "dataset": result,
+            "status": _dataset_status_payload(),
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Dataset conversion failed: {exc}")
+
+
+@app.post("/api/datasets/generate-ohlcv-eurusd")
+def generate_eurusd_ohlcv():
+    try:
+        result = generate_ohlcv_from_mt5_ticks()
+        return {
+            "message": "EURUSD OHLCV timeframes generated",
+            "files": result,
+            "status": _dataset_status_payload(),
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"OHLCV generation failed: {exc}")
+
+
+@app.post("/api/backtest/eurusd-demo")
+def run_eurusd_demo_backtest(payload: DatasetBacktestRequest):
+    try:
+        result = run_ema_backtest(
+            symbol=payload.symbol,
+            timeframe=payload.timeframe,
+            fast_ema=payload.fast_ema,
+            slow_ema=payload.slow_ema,
+            start_date=payload.start_date,
+            end_date=payload.end_date,
+            initial_balance=payload.initial_balance,
+        )
+        return {
+            "message": "EURUSD backtest completed",
+            "result": result,
+            "status": _dataset_status_payload(),
+        }
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Backtest failed: {exc}")
 
 
 @app.websocket("/ws/pipeline")
@@ -583,6 +924,22 @@ def get_strategy(strategy_id: int, db: Session = Depends(get_db)):
         with open(s.mql5_file, "r", encoding="utf-8") as f:
             mql5_code = f.read()
 
+    enriched_backtests = []
+    for backtest in results:
+        payload = backtest.as_dict()
+        report_file = payload.get("report_file")
+        if report_file and os.path.exists(report_file):
+            try:
+                with open(report_file, "r", encoding="utf-8") as report_handle:
+                    report_payload = json.load(report_handle)
+                payload["initial_balance"] = report_payload.get("initial_balance")
+                payload["start_date"] = report_payload.get("start_date")
+                payload["end_date"] = report_payload.get("end_date")
+                payload["data_source"] = report_payload.get("data_source")
+            except Exception:
+                pass
+        enriched_backtests.append(payload)
+
     return {
         "id":            s.id,
         "name":          s.name,
@@ -602,7 +959,7 @@ def get_strategy(strategy_id: int, db: Session = Depends(get_db)):
             "risk_percent": s.risk_percent,
         },
         "mql5_code": mql5_code,
-        "backtest_results": [r.as_dict() for r in results],
+        "backtest_results": enriched_backtests,
     }
 
 
@@ -1037,9 +1394,15 @@ def evolve_strategy(
         },
     }
 
-    log_info("evolution_agent", f"Starting evolution for {strategy_name} ({generations} generations)")
+    log_info(
+        "evolution_agent",
+        f"Starting evolution for {strategy_name} ({generations} generations) | saved_api_keys={len(get_configured_api_keys())} | saved_local_models={len(get_configured_local_models())}",
+    )
     result = run_evolution(base, generations=generations)
     parent_score = score_result(parse_mock_result(base["name"]))
+    child_scores = [entry.get("best_score", 0) for entry in result.get("generations", [])]
+    evaluation_advice, evaluation_meta = _evaluate_evolution_with_saved_integrations(base, child_scores, generations)
+    evolved_metrics = parse_mock_result(result["evolved"]["name"])
 
     if result["improved"]:
         evolved   = result["evolved"]
@@ -1051,6 +1414,23 @@ def evolve_strategy(
             generation   = s.generation + 1,
         )
         db.add(child_db)
+        db.commit()
+        db.refresh(child_db)
+
+        child_backtest = BacktestResult(
+            strategy_id=child_db.id,
+            net_profit=evolved_metrics.get("net_profit"),
+            max_drawdown=evolved_metrics.get("max_drawdown"),
+            win_rate=evolved_metrics.get("win_rate"),
+            total_trades=evolved_metrics.get("total_trades"),
+            profit_factor=evolved_metrics.get("profit_factor"),
+            sharpe_ratio=evolved_metrics.get("sharpe_ratio"),
+            recovery_factor=evolved_metrics.get("recovery_factor"),
+            monthly_profit=evolved_metrics.get("monthly_profit"),
+            yearly_profit=evolved_metrics.get("yearly_profit"),
+            status="completed",
+        )
+        db.add(child_backtest)
         db.commit()
         for key, parent_value in base["parameters"].items():
             child_value = p.get(key)
@@ -1068,8 +1448,10 @@ def evolve_strategy(
                     f"Score improved from {parent_score:.2f} to {result['best_score']:.2f}."
                 ),
             )
-        log_info("evolution_agent",
-                 f"Evolved {strategy_name} → {evolved['name']} (score: {result['best_score']})")
+        log_info(
+            "evolution_agent",
+            f"Evolved {strategy_name} -> {evolved['name']} (score: {result['best_score']}) | evaluation_provider={evaluation_meta['provider']}:{evaluation_meta['target']}",
+        )
     else:
         store_evolution_lesson(
             db,
@@ -1083,8 +1465,17 @@ def evolve_strategy(
                 f"Parent score remained {parent_score:.2f}."
             ),
         )
-        log_warn("evolution_agent", f"No improvement found for {strategy_name}")
+        log_warn(
+            "evolution_agent",
+            f"No improvement found for {strategy_name} | evaluation_provider={evaluation_meta['provider']}:{evaluation_meta['target']}",
+        )
 
+    result["evaluation"] = {
+        **evaluation_meta,
+        "advice": evaluation_advice,
+    }
+    result["evolved_metrics"] = evolved_metrics
+    result["gemini_advice"] = evaluation_advice
     return result
 
 
@@ -1096,217 +1487,66 @@ def evolve_strategy(
 @app.get("/api/agents")
 def list_agents(db: Session = Depends(get_db)):
     """
-    Phase 13: Return metadata for all registered AI agents.
-    Shows each agent's name, role, description, and live run count.
+    Phase 13: Return metadata for ALL registered AI agents.
+    Dynamically built from the orchestrator registry + intelligence agents.
+    Adding a new agent file no longer requires editing this function.
     """
     total_strategies = db.query(Strategy).count()
-    total_backtests  = db.query(BacktestResult).count()
-    evolved_count    = db.query(Strategy).filter(Strategy.generation > 0).count()
-    memory_events    = db.query(AgentMemory).count()
-    reflection_count = db.query(StrategyReflection).count()
+    total_backtests = db.query(BacktestResult).count()
+    evolved_count = db.query(Strategy).filter(Strategy.generation > 0).count()
 
-    return [
-        {
-            "id": 1,
-            "name": "Strategy Creator Agent",
-            "role": "strategy_creator",
-            "status": "active",
-            "description": "Generates structured strategy JSON with symbol, timeframe, and parameter payloads ready for the pipeline.",
-            "capabilities": ["structured JSON output", "timeframe-aware generation", "strategy bootstrapping"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/generate",
-        },
-        {
-            "id": 2,
-            "name": "Technical Indicator Agent",
-            "role": "technical_indicator_agent",
-            "status": "active",
-            "description": "Reviews EMA spacing, RSI bands, and reward-to-risk structure before the debate and approval stages.",
-            "capabilities": ["indicator spacing review", "reward/risk inspection", "structured pretrade signal review"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/{strategy_name}/agent-review",
-        },
-        {
-            "id": 3,
-            "name": "Bull Researcher Agent",
-            "role": "bull_researcher_agent",
-            "status": "active",
-            "description": "Builds the bullish case for a strategy and explains where the setup can compound when market conditions align.",
-            "capabilities": ["bull thesis generation", "upside scenario analysis", "structured evidence output"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/{strategy_name}/agent-review",
-        },
-        {
-            "id": 4,
-            "name": "Bear Researcher Agent",
-            "role": "bear_researcher_agent",
-            "status": "active",
-            "description": "Challenges the setup with downside scenarios, overtrading risks, and regime-specific failure cases.",
-            "capabilities": ["bear thesis generation", "drawdown challenge", "failure-mode analysis"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/{strategy_name}/agent-review",
-        },
-        {
-            "id": 5,
-            "name": "Risk Manager Agent",
-            "role": "risk_manager",
-            "status": "active",
-            "description": "Applies hard risk controls and validates whether the strategy can proceed to portfolio-level approval.",
-            "capabilities": ["stop-loss validation", "reward/risk rule checks", "risk gating"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/risk-check",
-        },
-        {
-            "id": 6,
-            "name": "MQL5 Code Agent",
-            "role": "mql5_code_agent",
-            "status": "active",
-            "description": "Turns structured strategy JSON into executable MQL5 expert advisor code and generated files.",
-            "capabilities": ["MQL5 generation", "code export", "EA packaging"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/generate-mql5",
-        },
-        {
-            "id": 7,
-            "name": "MT5 Backtest Agent",
-            "role": "mt5_backtest_agent",
-            "status": "active",
-            "description": "Runs mock or MT5-backed backtests, tracks pipeline stages, and reports execution status live.",
-            "capabilities": ["live pipeline execution", "mock backtests", "parallel-ready backtest orchestration"],
-            "runs": total_backtests,
-            "endpoint": "/api/pipeline/live",
-        },
-        {
-            "id": 8,
-            "name": "Backtest Analyst Agent",
-            "role": "backtest_analyst",
-            "status": "active",
-            "description": "Scores results, summarizes quality, and converts raw performance metrics into structured verdicts.",
-            "capabilities": ["composite scoring", "metrics grading", "performance analysis"],
-            "runs": total_backtests,
-            "endpoint": "/api/backtest/{strategy_name}",
-        },
-        {
-            "id": 9,
-            "name": "Portfolio Manager Agent",
-            "role": "portfolio_manager_agent",
-            "status": "active",
-            "description": "Approves, rejects, or sends strategies back for evolution based on observed profitability and drawdown.",
-            "capabilities": ["approval routing", "portfolio inclusion gating", "decision state output"],
-            "runs": reflection_count,
-            "endpoint": "/api/strategy/{strategy_name}/agent-review",
-        },
-        {
-            "id": 10,
-            "name": "Memory Reflection Agent",
-            "role": "memory_reflection_agent",
-            "status": "active",
-            "description": "Stores reflections, failed-strategy reasons, and reusable lessons so the system learns from prior runs.",
-            "capabilities": ["persistent memory", "reflection logging", "failure reason storage"],
-            "runs": memory_events,
-            "endpoint": "/api/memory/strategy/{strategy_name}",
-        },
-        {
-            "id": 11,
-            "name": "Evolution Agent",
-            "role": "evolution_agent",
-            "status": "active",
-            "description": "Mutates strategies across generations, stores evolution lessons, and promotes improved children into the database.",
-            "capabilities": ["parameter mutation", "evolution lessons", "generation tracking"],
-            "runs": evolved_count,
-            "endpoint": "/api/strategy/{name}/evolve",
-        },
-        {
-            "id": 12,
-            "name": "Gemini AI Analyst",
-            "role": "gemini_analyst",
-            "status": "active",
-            "description": "Adds natural-language post-analysis for strategies and backtests, with a rule-based fallback when no API key is set.",
-            "capabilities": ["AI explanation", "improvement suggestions", "natural-language analysis"],
-            "runs": total_strategies,
-            "endpoint": "/api/strategy/{name}/ai-analyze",
-        },
-        {
-            "id": 13,
-            "name": "Market Regime Agent",
-            "role": "market_regime_agent",
-            "status": "active",
-            "description": "Classifies market as trending, ranging, or volatile using EMA gap, ADX, and strategy type signals. Checks strategy fit against detected regime.",
-            "capabilities": ["regime_detection", "strategy_type_fit", "ema_gap_analysis"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/regime",
-        },
-        {
-            "id": 14,
-            "name": "Overfitting Detector Agent",
-            "role": "overfitting_detector_agent",
-            "status": "active",
-            "description": "Perturbs each parameter ±3–7% and measures score stability (CV). High sensitivity = likely curve-fitted.",
-            "capabilities": ["sensitivity_analysis", "parameter_perturbation", "robustness_check"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/overfit",
-        },
-        {
-            "id": 15,
-            "name": "Monte Carlo Agent",
-            "role": "monte_carlo_agent",
-            "status": "active",
-            "description": "Runs 1 000-scenario equity simulations. Reports ruin probability, tail-risk drawdown, and equity percentile distribution. Carries veto power.",
-            "capabilities": ["monte_carlo_simulation", "ruin_probability", "equity_distribution", "tail_risk"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/monte-carlo",
-        },
-        {
-            "id": 16,
-            "name": "Session Performance Agent",
-            "role": "session_performance_agent",
-            "status": "active",
-            "description": "Scores strategy compatibility across London, New York, Asian, and Overlap sessions based on strategy type and timeframe.",
-            "capabilities": ["session_scoring", "timeframe_analysis", "news_filter_check"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/sessions",
-        },
-        {
-            "id": 17,
-            "name": "Adaptive Risk Agent",
-            "role": "adaptive_risk_agent",
-            "status": "active",
-            "description": "Applies half-Kelly Criterion to compute optimal position sizing. Adjusts recommendation based on observed drawdown.",
-            "capabilities": ["kelly_criterion", "position_sizing", "drawdown_adjusted_risk"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/adaptive-risk",
-        },
-        {
-            "id": 18,
-            "name": "Correlation Guard Agent",
-            "role": "correlation_guard_agent",
-            "status": "active",
-            "description": "Computes cosine similarity between strategy parameter fingerprints. Rejects near-duplicate strategies and enforces portfolio diversification.",
-            "capabilities": ["cosine_similarity", "duplicate_detection", "diversification_check"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/correlation",
-        },
-        {
-            "id": 19,
-            "name": "Ensemble Voting Agent",
-            "role": "ensemble_voting_agent",
-            "status": "active",
-            "description": "Aggregates all agent decisions using confidence-weighted voting. Enforces hard veto from Risk Manager and Monte Carlo agents.",
-            "capabilities": ["weighted_voting", "veto_enforcement", "consensus_building", "decision_audit"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/orchestrate",
-        },
-        {
-            "id": 20,
-            "name": "Agent Orchestrator",
-            "role": "agent_orchestrator",
-            "status": "active",
-            "description": "Central hub that runs the full 12-agent pipeline sequentially, collects votes, enforces veto rules, and returns a complete decision trail.",
-            "capabilities": ["pipeline_execution", "agent_registry", "decision_trail", "timing_log"],
-            "runs": 0,
-            "endpoint": "/api/strategy/{name}/orchestrate",
-        },
+    runs_map = {
+        "strategy_creator":           total_strategies,
+        "technical_indicator_agent":  total_strategies,
+        "bull_researcher_agent":      total_strategies,
+        "bear_researcher_agent":      total_strategies,
+        "risk_manager_agent":         total_strategies,
+        "mql5_code_agent":            total_strategies,
+        "mt5_backtest_agent":         total_backtests,
+        "backtest_analyst":           total_backtests,
+        "portfolio_manager_agent":    total_strategies,
+        "memory_reflection_agent":    total_strategies,
+        "evolution_agent":            evolved_count,
+        "gemini_analyst":             total_strategies,
+        "market_regime_agent":        0,
+        "overfitting_detector_agent": 0,
+        "monte_carlo_agent":          0,
+        "session_performance_agent":  0,
+        "adaptive_risk_agent":        0,
+        "correlation_guard_agent":    0,
+        "ensemble_voting_agent":      0,
+        "sentiment_agent":            total_strategies,
+        "macro_calendar_agent":       total_strategies,
+        "seasonality_agent":          total_strategies,
+        "drawdown_recovery_agent":    total_backtests,
+        "multi_symbol_correlation_agent": total_strategies,
+        "regime_change_detector_agent":   total_strategies,
+        "slippage_spread_agent":      total_backtests,
+        "strategy_retirement_agent":  total_strategies,
+        "portfolio_rebalancer_agent": total_strategies,
+        "alert_notification_agent":   total_strategies,
+        "benchmark_comparison_agent": total_backtests,
+    }
+
+    orchestrator = get_orchestrator()
+    core_agents = orchestrator.get_agent_list(runs_map)
+
+    intelligence_agents = [
+        {"id": len(core_agents) + 1,  "name": "Sentiment Analysis Agent",       "role": "sentiment_agent",               "category": "intelligence", "status": "active", "description": "Scores bullish/bearish sentiment for the strategy's symbol.", "capabilities": ["news_scoring", "social_sentiment", "symbol_bias"],        "runs": total_strategies, "endpoint": "/api/strategy/{name}/sentiment"},
+        {"id": len(core_agents) + 2,  "name": "Macro Calendar Agent",           "role": "macro_calendar_agent",          "category": "intelligence", "status": "active", "description": "Monitors high-impact events (CPI, NFP, Fed) and assesses strategy risk.", "capabilities": ["event_calendar", "pause_windows", "impact_scoring"],   "runs": total_strategies, "endpoint": "/api/strategy/{name}/macro"},
+        {"id": len(core_agents) + 3,  "name": "Seasonality Agent",              "role": "seasonality_agent",             "category": "intelligence", "status": "active", "description": "Detects day-of-week, time-of-day, and month-of-year bias patterns.", "capabilities": ["dow_analysis", "monthly_bias", "session_timing"],        "runs": total_strategies, "endpoint": "/api/strategy/{name}/seasonality"},
+        {"id": len(core_agents) + 4,  "name": "Drawdown Recovery Agent",        "role": "drawdown_recovery_agent",       "category": "risk",         "status": "active", "description": "Detects extended drawdown and triggers parameter adjustment.", "capabilities": ["drawdown_detection", "recovery_playbook", "risk_scaling"], "runs": total_backtests,  "endpoint": "/api/strategy/{name}/drawdown-recovery"},
+        {"id": len(core_agents) + 5,  "name": "Multi-Symbol Correlation Agent", "role": "multi_symbol_correlation_agent","category": "risk",         "status": "active", "description": "Tracks live correlations across pairs to prevent over-exposure.", "capabilities": ["pearson_correlation", "direction_exposure", "diversification"], "runs": total_strategies, "endpoint": "/api/strategy/{name}/multi-symbol-correlation"},
+        {"id": len(core_agents) + 6,  "name": "Regime Change Detector",         "role": "regime_change_detector_agent",  "category": "technical",    "status": "active", "description": "Alerts on trending-to-ranging transitions via ADX signals.", "capabilities": ["adx_analysis", "regime_transitions", "volatility_signals"], "runs": total_strategies, "endpoint": "/api/strategy/{name}/regime-change"},
+        {"id": len(core_agents) + 7,  "name": "Slippage & Spread Agent",        "role": "slippage_spread_agent",         "category": "quantitative", "status": "active", "description": "Models realistic execution costs and re-scores on net-of-cost profitability.", "capabilities": ["spread_modeling", "slippage_estimation", "cost_drag"], "runs": total_backtests,  "endpoint": "/api/strategy/{name}/slippage"},
+        {"id": len(core_agents) + 8,  "name": "Strategy Retirement Agent",      "role": "strategy_retirement_agent",     "category": "meta",         "status": "active", "description": "Archives strategies whose live performance diverges from backtest.", "capabilities": ["divergence_detection", "retirement_rules", "archive_trigger"], "runs": total_strategies, "endpoint": "/api/strategy/{name}/retirement-check"},
+        {"id": len(core_agents) + 9,  "name": "Portfolio Rebalancer Agent",     "role": "portfolio_rebalancer_agent",    "category": "meta",         "status": "active", "description": "Reassigns capital weights using Sharpe-ratio-weighted allocation.", "capabilities": ["erc_weighting", "sharpe_tilt", "concentration_control"],  "runs": total_strategies, "endpoint": "/api/portfolio/rebalance"},
+        {"id": len(core_agents) + 10, "name": "Alert & Notification Agent",     "role": "alert_notification_agent",      "category": "meta",         "status": "active", "description": "Pushes structured alerts on milestones: profit target, drawdown limit.", "capabilities": ["milestone_detection", "alert_rules", "severity_levels"], "runs": total_strategies, "endpoint": "/api/strategy/{name}/alerts"},
+        {"id": len(core_agents) + 11, "name": "Benchmark Comparison Agent",     "role": "benchmark_comparison_agent",    "category": "quantitative", "status": "active", "description": "Compares strategy vs Buy-and-Hold and MA crossover baseline.", "capabilities": ["bnh_comparison", "ma_baseline", "alpha_calculation"],      "runs": total_backtests,  "endpoint": "/api/strategy/{name}/benchmark"},
     ]
+
+    return core_agents + intelligence_agents
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1357,7 +1597,7 @@ def ai_analyze(strategy_name: str, db: Session = Depends(get_db)):
         }
 
     log_info("gemini_analyst", f"Running AI analysis for {strategy_name}")
-    analysis_text   = analyze_strategy(strategy_dict, metrics)
+    analysis_text = analyze_strategy(strategy_dict, metrics)
     suggestion_text = suggest_improvement(strategy_dict, metrics) if metrics else None
 
     return {
@@ -1428,6 +1668,28 @@ def get_strategy_memory(strategy_name: str, db: Session = Depends(get_db)):
             for row in db.query(PipelineCheckpoint)
             .filter(PipelineCheckpoint.strategy_name == strategy_name)
             .order_by(PipelineCheckpoint.created_at.asc())
+            .all()
+        ],
+        "debates": [
+            row.as_dict()
+            for row in db.query(DebateRecord)
+            .filter(DebateRecord.strategy_name == strategy_name)
+            .order_by(DebateRecord.created_at.desc())
+            .all()
+        ],
+        "agent_calibration": [
+            row.as_dict()
+            for row in db.query(AgentCalibration)
+            .filter(AgentCalibration.strategy_name == strategy_name)
+            .order_by(AgentCalibration.created_at.desc())
+            .all()
+        ],
+        "walk_forward_runs": [
+            row.as_dict()
+            for row in db.query(WalkForwardResult)
+            .join(Strategy, Strategy.id == WalkForwardResult.strategy_id)
+            .filter(Strategy.name == strategy_name)
+            .order_by(WalkForwardResult.created_at.desc())
             .all()
         ],
     }
@@ -2024,15 +2286,24 @@ def _load_strategy_and_metrics(name: str, db: Session, mock: bool = True):
     row = db.query(Strategy).filter(Strategy.name == name).first()
     strategy = None
     if row:
+        # Start with extended parameters from JSON blob (MACD, Bollinger, Ichimoku, etc.)
+        params: dict = {}
+        if row.parameters_json:
+            try:
+                params = json.loads(row.parameters_json)
+            except Exception:
+                pass
+        # Individual columns always override the JSON blob
+        params.update({
+            "fast_ema": row.fast_ema, "slow_ema": row.slow_ema,
+            "rsi_period": row.rsi_period, "rsi_buy": row.rsi_buy,
+            "rsi_sell": row.rsi_sell, "stop_loss": row.stop_loss,
+            "take_profit": row.take_profit, "risk_percent": row.risk_percent,
+        })
         strategy = {
             "name": row.name, "symbol": row.symbol, "timeframe": row.timeframe,
             "strategy_type": row.type,
-            "parameters": {
-                "fast_ema": row.fast_ema, "slow_ema": row.slow_ema,
-                "rsi_period": row.rsi_period, "rsi_buy": row.rsi_buy,
-                "rsi_sell": row.rsi_sell, "stop_loss": row.stop_loss,
-                "take_profit": row.take_profit, "risk_percent": row.risk_percent,
-            },
+            "parameters": params,
         }
     metrics = parse_mock_result(name) if mock else None
     return strategy, metrics
@@ -2044,7 +2315,7 @@ def agent_regime(name: str, db: Session = Depends(get_db)):
     """Market Regime Agent — classify market state and check strategy type fit."""
     strategy, metrics = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
     log_info("market_regime_agent", f"Regime check for {name}")
     return run_market_regime_agent(strategy, metrics)
 
@@ -2055,7 +2326,7 @@ def agent_overfit(name: str, db: Session = Depends(get_db)):
     """Overfitting Detector Agent — parameter sensitivity analysis."""
     strategy, metrics = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
     log_info("overfitting_detector_agent", f"Overfit check for {name}")
     return run_overfitting_detector(strategy, metrics)
 
@@ -2066,7 +2337,7 @@ def agent_monte_carlo(name: str, simulations: int = Query(1000, ge=100, le=10000
     """Monte Carlo Agent — ruin probability and equity distribution simulation."""
     strategy, metrics = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
     log_info("monte_carlo_agent", f"Monte Carlo ({simulations} sims) for {name}")
     return run_monte_carlo_agent(strategy, metrics, n_simulations=simulations)
 
@@ -2077,7 +2348,7 @@ def agent_sessions(name: str, db: Session = Depends(get_db)):
     """Session Performance Agent — score strategy fit across trading sessions."""
     strategy, metrics = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "timeframe": "M15", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
     log_info("session_performance_agent", f"Session analysis for {name}")
     return run_session_performance_agent(strategy, metrics)
 
@@ -2088,7 +2359,7 @@ def agent_adaptive_risk(name: str, db: Session = Depends(get_db)):
     """Adaptive Risk Agent — Kelly Criterion optimal position sizing."""
     strategy, metrics = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
     log_info("adaptive_risk_agent", f"Adaptive risk sizing for {name}")
     return run_adaptive_risk_agent(strategy, metrics)
 
@@ -2099,7 +2370,7 @@ def agent_correlation(name: str, db: Session = Depends(get_db)):
     """Correlation Guard Agent — check similarity with existing portfolio strategies."""
     strategy, _ = _load_strategy_and_metrics(name, db)
     if not strategy:
-        strategy = {"name": name, "strategy_type": "ema_rsi", "parameters": {}}
+        raise HTTPException(status_code=404, detail=f"Strategy '{name}' not found")
 
     # Build list of existing strategies from DB (excluding this one)
     rows = db.query(Strategy).filter(Strategy.name != name).limit(50).all()
@@ -2144,13 +2415,21 @@ def orchestrate_strategy(name: str, mock: bool = Query(True), db: Session = Depe
                 "rsi_sell": r.rsi_sell, "stop_loss": r.stop_loss,
                 "take_profit": r.take_profit, "risk_percent": r.risk_percent,
             },
+            "metrics_history": [
+                bt.as_dict()
+                for bt in db.query(BacktestResult)
+                .filter(BacktestResult.strategy_id == r.id)
+                .order_by(BacktestResult.created_at.desc())
+                .limit(8)
+                .all()
+            ],
         }
         for r in rows
     ]
 
     log_info("orchestrator", f"Full orchestration started for {name} (mock={mock})")
     orchestrator = get_orchestrator()
-    result = orchestrator.run(strategy, metrics, portfolio_strategies=portfolio)
+    result = orchestrator.run(strategy, metrics, portfolio_strategies=portfolio, db=db)
     log_info("orchestrator", f"Orchestration complete: {result['final_decision']} (confidence={result['final_confidence']})")
     return result
 
@@ -2170,31 +2449,39 @@ def list_agents_v2(db: Session = Depends(get_db)):
     evolved_count    = db.query(Strategy).filter(Strategy.generation > 0).count()
 
     runs_map = {
-        "strategy_creator":           total_strategies,
-        "technical_indicator_agent":  total_strategies,
-        "bull_researcher_agent":      total_strategies,
-        "bear_researcher_agent":      total_strategies,
-        "risk_manager_agent":         total_strategies,
-        "mql5_code_agent":            total_strategies,
-        "mt5_backtest_agent":         total_backtests,
-        "backtest_analyst":           total_backtests,
-        "portfolio_manager_agent":    total_strategies,
-        "memory_reflection_agent":    total_strategies,
-        "evolution_agent":            evolved_count,
-        "gemini_analyst":             total_strategies,
-        "market_regime_agent":        0,
-        "overfitting_detector_agent": 0,
-        "monte_carlo_agent":          0,
-        "session_performance_agent":  0,
-        "adaptive_risk_agent":        0,
-        "correlation_guard_agent":    0,
-        "ensemble_voting_agent":      0,
+        "technical_indicator_agent": total_strategies,
+        "bull_researcher_agent": total_strategies,
+        "bear_researcher_agent": total_strategies,
+        "debate_agent": total_strategies,
+        "risk_manager_agent": total_strategies,
+        "multi_timeframe_agent": total_strategies,
+        "market_regime_agent": total_strategies,
+        "overfitting_detector_agent": total_backtests,
+        "monte_carlo_agent": total_backtests,
+        "walk_forward_agent": total_backtests,
+        "session_performance_agent": total_strategies,
+        "adaptive_risk_agent": total_backtests,
+        "regime_adaptive_parameter_agent": total_strategies,
+        "correlation_guard_agent": total_strategies,
+        "sentiment_agent": total_strategies,
+        "news_sentiment_nlp_agent": total_strategies,
+        "macro_calendar_agent": total_strategies,
+        "seasonality_agent": total_strategies,
+        "drawdown_recovery_agent": total_backtests,
+        "multi_symbol_correlation_agent": total_strategies,
+        "regime_change_detector_agent": total_strategies,
+        "slippage_spread_agent": total_backtests,
+        "benchmark_comparison_agent": total_backtests,
+        "portfolio_manager_agent": total_strategies,
+        "ensemble_voting_agent": total_strategies,
+        "evolution_agent": evolved_count,
     }
 
     orchestrator = get_orchestrator()
+    agents = orchestrator.get_agent_list(runs_map)
     return {
-        "total_agents": 20,
-        "agents": orchestrator.get_agent_list(runs_map),
+        "total_agents": len(agents),
+        "agents": agents,
     }
 
 
@@ -2230,6 +2517,42 @@ def agent_seasonality(strategy_name: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Strategy not found")
     log_info("seasonality_agent", f"Seasonality check for {strategy_name}")
     return run_seasonality_agent(strategy, metrics)
+
+
+@app.get("/api/strategy/{strategy_name}/debate")
+def agent_debate(strategy_name: str, db: Session = Depends(get_db)):
+    strategy, metrics = _load_strategy_and_metrics(strategy_name, db)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    log_info("debate_agent", f"Debate review for {strategy_name}")
+    return run_debate_agent(strategy, metrics, rounds=3)
+
+
+@app.get("/api/strategy/{strategy_name}/multi-timeframe")
+def agent_multi_timeframe(strategy_name: str, db: Session = Depends(get_db)):
+    strategy, metrics = _load_strategy_and_metrics(strategy_name, db)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    log_info("multi_timeframe_agent", f"Multi-timeframe check for {strategy_name}")
+    return run_multi_timeframe_agent(strategy, metrics)
+
+
+@app.get("/api/strategy/{strategy_name}/news-sentiment-nlp")
+def agent_news_sentiment_nlp(strategy_name: str, db: Session = Depends(get_db)):
+    strategy, metrics = _load_strategy_and_metrics(strategy_name, db)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    log_info("news_sentiment_nlp_agent", f"NLP sentiment check for {strategy_name}")
+    return run_news_sentiment_nlp_agent(strategy, metrics)
+
+
+@app.get("/api/strategy/{strategy_name}/regime-adaptive")
+def agent_regime_adaptive(strategy_name: str, db: Session = Depends(get_db)):
+    strategy, metrics = _load_strategy_and_metrics(strategy_name, db)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    log_info("regime_adaptive_parameter_agent", f"Regime-adaptive tuning for {strategy_name}")
+    return run_regime_adaptive_parameter_agent(strategy, metrics)
 
 
 @app.get("/api/strategy/{strategy_name}/drawdown-recovery")
@@ -2394,17 +2717,40 @@ def list_all_agents(db: Session = Depends(get_db)):
 
     orchestrator = get_orchestrator()
     runs_map = {
-        "strategy_creator": total_strategies, "technical_indicator_agent": total_strategies,
-        "bull_researcher_agent": total_strategies, "bear_researcher_agent": total_strategies,
-        "risk_manager_agent": total_strategies, "evolution_agent": db.query(Strategy).filter(Strategy.generation > 0).count(),
+        "technical_indicator_agent": total_strategies,
+        "bull_researcher_agent": total_strategies,
+        "bear_researcher_agent": total_strategies,
+        "debate_agent": total_strategies,
+        "risk_manager_agent": total_strategies,
+        "multi_timeframe_agent": total_strategies,
+        "market_regime_agent": total_strategies,
+        "overfitting_detector_agent": total_backtests,
+        "monte_carlo_agent": total_backtests,
+        "walk_forward_agent": total_backtests,
+        "session_performance_agent": total_strategies,
+        "adaptive_risk_agent": total_backtests,
+        "regime_adaptive_parameter_agent": total_strategies,
+        "correlation_guard_agent": total_strategies,
+        "sentiment_agent": total_strategies,
+        "news_sentiment_nlp_agent": total_strategies,
+        "macro_calendar_agent": total_strategies,
+        "seasonality_agent": total_strategies,
+        "drawdown_recovery_agent": total_backtests,
+        "multi_symbol_correlation_agent": total_strategies,
+        "regime_change_detector_agent": total_strategies,
+        "slippage_spread_agent": total_backtests,
+        "benchmark_comparison_agent": total_backtests,
+        "portfolio_manager_agent": total_strategies,
+        "ensemble_voting_agent": total_strategies,
+        "evolution_agent": db.query(Strategy).filter(Strategy.generation > 0).count(),
     }
     core_agents = orchestrator.get_agent_list(runs_map)
 
     return {
-        "total_agents": len(core_agents) + len(new_intelligence_agents),
+        "total_agents": len(core_agents),
         "core_agents": core_agents,
-        "intelligence_agents": new_intelligence_agents,
-        "all_agents": core_agents + new_intelligence_agents,
+        "intelligence_agents": [],
+        "all_agents": core_agents,
     }
 
 
@@ -2432,10 +2778,12 @@ def get_mission_detail(mission_id: int, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Mission not found")
     steps = db.query(MissionStep).filter(MissionStep.mission_id == mission_id).order_by(MissionStep.step_number).all()
     trace = get_reasoning_trace(db, mission_id)
+    strategy_snapshot = get_mission_strategy_snapshot(db, mission)
     return {
         "mission": mission.as_dict(),
         "steps": [s.as_dict() for s in steps],
         "reasoning_trace": [r.as_dict() for r in trace],
+        "strategy": strategy_snapshot,
     }
 
 
@@ -2555,23 +2903,34 @@ def run_walk_forward_validation(strategy_id: int, db: Session = Depends(get_db))
     if not strat:
         raise HTTPException(status_code=404, detail="Strategy not found")
 
-    import random as _r
-    rng = _r.Random(strategy_id + 1000)
-    backtest = strat.backtest_results[-1] if strat.backtest_results else None
-    base_pf = backtest.profit_factor if backtest else 1.4
-
-    windows = [{"window": i+1, "in_sample_pf": round(base_pf + rng.uniform(-0.2,0.3),2), "out_sample_pf": round(base_pf - rng.uniform(0,0.4),2)} for i in range(5)]
-    avg_oos = sum(w["out_sample_pf"] for w in windows) / 5
-    robustness = min(100, max(0, int((avg_oos / base_pf) * 80 + 10)))
+    strategy_dict = strat.as_dict()
+    metrics = strat.backtest_results[-1].as_dict() if strat.backtest_results else None
+    from services.agent_orchestrator import _run_walk_forward_agent
+    wf = _run_walk_forward_agent(strategy_dict, metrics)
+    data = wf.get("data", {})
+    windows = data.get("windows", [])
+    avg_oos = float(data.get("average_out_of_sample_pf", 0) or 0)
+    robustness = float(data.get("consistency_score", 0) or 0)
 
     report = ValidationReport(
         strategy_id=strategy_id, validation_type="walk_forward",
-        robustness_score=float(robustness), risk_score=float(min(100, max(0, robustness - 10))),
-        passed=str(avg_oos >= 1.0).lower(),
-        summary=f"Walk-forward (5 windows): avg OOS profit factor {avg_oos:.2f}, robustness {robustness}/100",
-        details_json=json.dumps({"windows": windows, "avg_out_of_sample_pf": round(avg_oos, 2)}),
+        robustness_score=float(robustness), risk_score=float(max(0.0, 100.0 - float(data.get("degradation_pct", 0) or 0))),
+        passed=str(wf.get("decision") in ("approve", "needs_retest")).lower(),
+        summary=wf.get("reason"),
+        details_json=json.dumps(data),
     )
-    db.add(report); db.commit(); db.refresh(report)
+    db.add(report)
+    db.add(WalkForwardResult(
+        strategy_id=strategy_id,
+        windows_json=json.dumps(windows),
+        consistency_score=float(robustness),
+        is_avg_profit=float(sum(w.get("in_sample_pf", 0) for w in windows) / max(len(windows), 1)),
+        oos_avg_profit=float(avg_oos),
+        degradation_pct=float(data.get("degradation_pct", 0) or 0),
+        passed=str(wf.get("decision") in ("approve", "needs_retest")).lower(),
+    ))
+    db.commit()
+    db.refresh(report)
     return {"strategy_id": strategy_id, "validation": report.as_dict()}
 
 

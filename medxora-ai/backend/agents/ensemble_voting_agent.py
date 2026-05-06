@@ -6,17 +6,30 @@ the ensemble final decision is forced to "reject" regardless of other votes.
 """
 
 _AGENT_WEIGHTS: dict[str, float] = {
-    "Market Regime Agent":         0.65,
-    "Technical Indicator Agent":   0.70,
-    "Bull Researcher Agent":       0.55,
-    "Bear Researcher Agent":       0.75,
-    "Risk Manager Agent":          0.90,
-    "Overfitting Detector Agent":  0.80,
-    "Monte Carlo Agent":           0.85,
-    "Session Performance Agent":   0.50,
-    "Adaptive Risk Agent":         0.60,
-    "Correlation Guard Agent":     0.70,
-    "Portfolio Manager Agent":     0.85,
+    # Core analysis agents
+    "Market Regime Agent":             0.65,
+    "Technical Indicator Agent":       0.70,
+    "Bull Researcher Agent":           0.55,
+    "Bear Researcher Agent":           0.75,
+    "Risk Manager Agent":              0.90,
+    "Overfitting Detector Agent":      0.80,
+    "Monte Carlo Agent":               0.85,
+    "Session Performance Agent":       0.50,
+    "Adaptive Risk Agent":             0.60,
+    "Correlation Guard Agent":         0.70,
+    "Portfolio Manager Agent":         0.85,
+    # Intelligence agents (v2) — previously unregistered, now included
+    "Sentiment Analysis Agent":        0.55,
+    "Macro Calendar Agent":            0.65,
+    "Seasonality Agent":               0.50,
+    "Drawdown Recovery Agent":         0.70,
+    "Multi-Symbol Correlation Agent":  0.65,
+    "Regime Change Detector":          0.60,
+    "Slippage & Spread Agent":         0.70,
+    "Strategy Retirement Agent":       0.65,
+    "Portfolio Rebalancer Agent":      0.60,
+    "Alert & Notification Agent":      0.55,
+    "Benchmark Comparison Agent":      0.65,
 }
 
 _VETO_AGENTS = {"Risk Manager Agent", "Monte Carlo Agent"}
@@ -54,7 +67,7 @@ def run_ensemble_voting_agent(agent_decisions: list[dict]) -> dict:
         decision   = d.get("decision", "needs_retest")
         confidence = float(d.get("confidence", 0.5))
         risk_level = d.get("risk_level", "medium")
-        weight     = _AGENT_WEIGHTS.get(name, 0.60)
+        weight     = float(d.get("weight", _AGENT_WEIGHTS.get(name, 0.60)) or _AGENT_WEIGHTS.get(name, 0.60))
         eff_weight = weight * confidence
 
         score = _SCORE_MAP.get(decision, 0.0)

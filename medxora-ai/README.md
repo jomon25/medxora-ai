@@ -1,564 +1,239 @@
 # MedXora AI
-### Gemini-Powered Multi-Agent Trading Strategy Research Engine
 
-> A supervised AI agent that plans, generates, validates, evolves, stores, searches, and exports MetaTrader 5 trading strategies under human control.
+MedXora AI is a research-focused trading strategy workbench for generating, backtesting, evolving, reviewing, and exporting MetaTrader 5 strategies. It combines a FastAPI backend, a React dashboard, local SQLite storage, optional MT5 execution, optional MongoDB-backed memory, and Gemini-assisted mission workflows.
 
-**MedXora AI uses Gemini as the reasoning brain, FastAPI tools for execution, MCP for memory/search/observability, and a React dashboard for human oversight.**
+## Current Status
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Python](https://img.shields.io/badge/Python-3.10+-blue.svg)](https://python.org)
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com)
-[![React](https://img.shields.io/badge/React-18-61dafb.svg)](https://react.dev)
-[![Gemini](https://img.shields.io/badge/Gemini-1.5--flash-4285F4.svg)](https://ai.google.dev)
+This repository is in active prototype/beta shape, but the core application is running.
 
----
+Verified on May 7, 2026:
 
-## One-Line Pitch
+- Frontend lint passes: `npm run lint`
+- Frontend production build passes: `npm run build`
+- Backend Python modules compile successfully
+- Backend app imports successfully
+- Evolution/evaluation flow was updated to use long-running requests and retain post-evolution comparison data more reliably
 
-MedXora AI is a Gemini-powered multi-agent research engine that autonomously plans, generates, backtests, evolves, and exports MetaTrader 5 trading strategies — with full human oversight, MCP memory integration, and an explainable AI reasoning trace at every step.
+## What The Project Does
 
----
+MedXora AI currently supports these main workflows:
 
-## The Problem
+- Generate and save trading strategies
+- Generate MQL5 code for saved strategies
+- Run mock backtests and optional MT5-backed backtests
+- Inspect strategy performance in the dashboard
+- Evolve a strategy across generations
+- Compare strategy metrics before and after evolution
+- Run mission-style guided workflows from Mission Control
+- Save and use AI integration settings for evaluation
+- Store strategy history and validation records in SQLite
+- Use MongoDB as an optional MCP-style memory layer with SQLite fallback
 
-Building a profitable algorithmic trading strategy requires:
-- Generating hundreds of parameter combinations
-- Validating risk on every candidate
-- Backtesting across multiple timeframes
-- Evolving survivors with genetic algorithms
-- Comparing against historical memory
-- Exporting only human-approved strategies
+## Main Product Areas
 
-This multi-step research process normally takes days of manual work — and has no explainability or audit trail.
+### Frontend Pages
 
----
+- `Command Center`: high-level KPIs, pipeline actions, activity views
+- `Strategy Lab`: strategy browsing, detail inspection, backtest/evaluation entry points
+- `Mission Control`: guided multi-step mission workflow with approvals
+- `Dataset Engine`: raw MT5 tick conversion, OHLCV generation, demo dataset backtest
+- `Evolution Lab`: strategy search, evolution, before/after evaluation comparison
+- `Agent Control Room`: agent overview and graph-style visualization
+- `Portfolio Optimizer`: portfolio summary and selected mixes
+- `Risk Center`: drawdown and risk visibility
+- `Logs`: backend logs plus AI integration settings
+- `Settings`: mode, timeframe, service visibility
 
-## The Solution: MedXora AI Mission Control
+### Backend Capabilities
 
-MedXora AI replaces that manual workflow with a **supervised AI agent**.
+- Strategy generation and persistence
+- MQL5 file generation
+- Mock and MT5-backed backtesting
+- Evolution engine with generation history
+- Validation endpoints such as Monte Carlo and walk-forward
+- Mission orchestration endpoints
+- Strategy lineage retrieval
+- Log collection
+- Integration settings storage
+- Dataset preparation utilities
 
-You describe a goal in plain English:
+## Architecture Overview
 
-> "Create a low-risk EURUSD strategy on M15, backtest it, evolve for 3 generations, validate with Monte Carlo, and export the champion MQL5 EA."
-
-Gemini converts it into a structured 14-step mission plan. The agent executes each step, pauses for human approval at critical gates, shows its reasoning trace in real-time, and exports only approved strategies.
-
-**This is not a chatbot. It is an agent that plans, executes, observes, and decides.**
-
----
-
-## Why This Is an Agent, Not a Chatbot
-
-| Chatbot | MedXora AI Agent |
-|---------|-----------------|
-| Answers questions | Takes multi-step actions |
-| Single-turn | Multi-turn mission with state |
-| No tool calls | Calls 14+ specialised tools |
-| No memory | MCP MongoDB/SQLite memory |
-| No oversight | Human approval gates |
-| No observability | Full Gemini reasoning trace |
-| No external integrations | MongoDB MCP partner integration |
-
----
-
-## Architecture
-
-```
-User (Browser)
-     │
-     ▼
-React Dashboard (Vite + Tailwind)
-     │  Mission Control / Agent Control Room / Evolution Lab
-     │
-     ▼
-FastAPI Backend (Python)
-     │
-     ├─ Gemini Planner ──────── plan_mission()
-     │                          critique_strategy()
-     │                          explain_risk()
-     │                          advise_evolution()
-     │                          write_final_report()
-     │                          route_tool()
-     │
-     ├─ MedXora Tools ──────── generate_strategy
-     │                          risk_manager
-     │                          mql5_generator
-     │                          backtest_mock / MT5
-     │                          evolution_agent (genetic)
-     │                          monte_carlo_agent
-     │                          ensemble_voting (16 agents)
-     │                          mql5_export
-     │
-     ├─ MCP Partner ─────────── MongoDB (strategy memory)
-     │                          Local SQLite (fallback)
-     │
-     └─ Database ────────────── SQLite via SQLAlchemy ORM
-                                missions, steps, reasoning logs,
-                                human approvals, MCP events,
-                                strategy memory, validation reports
+```text
+React + Vite frontend
+  -> axios API client
+  -> FastAPI backend
+  -> services + agents layer
+  -> SQLite database
+  -> optional MongoDB memory
+  -> optional MT5 terminal workflow
+  -> optional Gemini-assisted planning/evaluation flows
 ```
 
----
+## Repository Layout
 
-## Gemini Integration
-
-Gemini (`gemini-1.5-flash`) is the **central reasoning brain**, not an optional add-on.
-
-| Gemini Role | Function | When Used |
-|-------------|----------|-----------|
-| **Mission Planner** | Converts user goal → structured 14-step plan | Mission start |
-| **Strategy Critic** | Quality score 0-100, verdict: approve/reject | After generation |
-| **Risk Explainer** | Plain-English explanation of risk decisions | After risk validation |
-| **Evolution Advisor** | Suggests mutation direction for next generation | Between generations |
-| **Report Writer** | Generates final judge-friendly research report | On export |
-| **Tool Router** | Decides which backend tool to call next | Between steps |
-
-### Example Gemini Reasoning Trace
-
+```text
+medxora-ai/
+|-- backend/
+|   |-- agents/          # Strategy, evolution, risk, validation, intelligence agents
+|   |-- services/        # API helpers, orchestration, storage, integrations, MT5 utilities
+|   |-- database/        # SQLAlchemy setup and ORM tables
+|   |-- main.py          # Main FastAPI application and routes
+|   |-- config.py        # Environment/path configuration
+|   `-- requirements.txt
+|-- frontend/
+|   |-- src/
+|   |   |-- AgentGraphUI.jsx
+|   |   |-- DatasetEnginePage.jsx
+|   |   `-- api.js
+|   |-- package.json
+|   `-- README.md
+|-- generated_strategies/
+|-- backtest_reports/
+|-- mt5_workspace/
+|-- research/
+`-- medxora.db
 ```
-Goal: Create a low-risk EURUSD strategy.
-
-Gemini Plan:
-  1. Generate EMA+RSI strategy
-  2. Validate risk parameters
-  3. Run mock backtest
-  4. Calculate fitness score
-  5. Monte Carlo validation
-  6. Evolve for 3 generations [APPROVAL REQUIRED]
-  7. Search strategy memory (MCP)
-  8. Select champion via ensemble voting [APPROVAL REQUIRED]
-  9. Human approval gate [APPROVAL REQUIRED]
-  10. Export MQL5 [APPROVAL REQUIRED]
-  11. Generate Gemini report
-
-Current Decision:
-  Step 3 completed — Win rate 61.5%, Sharpe 1.64, Drawdown 8.2%
-  Strategy passes risk threshold.
-
-Next Action:
-  Proceed to fitness scoring.
-  Confidence: 92%
-```
-
----
-
-## Google Cloud Integration
-
-- **Gemini API** — `gemini-1.5-flash` via `google-generativeai` SDK
-- **Firebase Hosting** — Frontend deployment target (see Deployment section)
-- **Cloud Run** — Backend containerised deployment target
-- **Google Cloud Run** deployment guide included below
-
----
-
-## MCP Partner Integration
-
-MedXora AI integrates **MongoDB** as the partner MCP for strategy memory.
-
-### What is stored in MongoDB:
-```json
-{
-  "strategy_name": "EURUSD_EMA_RSI_Champion_01",
-  "pair": "EURUSD",
-  "timeframe": "M15",
-  "sharpe": 1.64,
-  "drawdown": 8.2,
-  "win_rate": 61.5,
-  "profit_factor": 1.87,
-  "risk_status": "approved",
-  "mql5_exported": true,
-  "created_at": "2026-05-05T10:30:00Z"
-}
-```
-
-### MCP Capabilities:
-| Endpoint | Action |
-|----------|--------|
-| `POST /api/mcp/save-strategy-memory` | Store strategy in MongoDB |
-| `POST /api/mcp/search-strategies` | Semantic search: min Sharpe, max drawdown, risk status |
-| `POST /api/mcp/save-agent-log` | Log agent decisions |
-| `POST /api/mcp/observe-mission` | Record mission observations |
-| `GET /api/mcp/status` | MongoDB + fallback status |
-
-**Fallback:** When `MONGODB_URI` is not set, all MCP operations fall back to local SQLite automatically — the app always works.
-
----
-
-## Features
-
-### Core Features
-- **Gemini Mission Control** — Natural language goal → structured multi-step agent mission
-- **16+ AI Agents** — Risk Manager, Monte Carlo, Overfitting Detector, Ensemble Voting, Sentiment, Market Regime, Correlation Guard, and more
-- **Strategy Generation** — Randomised EMA+RSI parameter combinations
-- **MQL5 Code Generation** — Ready-to-deploy Expert Advisor `.mq5` files
-- **Mock Backtesting** — Instant seeded results (no MT5 required)
-- **MT5 Backtesting** — Real MetaTrader 5 integration when installed
-- **Genetic Evolution** — Multi-generation mutation with fitness scoring
-- **Monte Carlo Validation** — 1000-simulation robustness testing
-- **Walk-Forward Validation** — 5-window anti-overfitting test
-- **Human Approval Gates** — Approve/reject before evolution, export, champion designation
-- **MCP Memory** — MongoDB strategy memory with search
-- **Strategy Lineage** — Full evolution tree per strategy
-- **Gemini Reports** — AI-generated final research reports
-- **One-Click Demo** — Judge demo runs a complete 14-step mission instantly
-
-### Dashboard Pages
-| Page | Purpose |
-|------|---------|
-| **Mission Control** | Gemini-planned multi-step missions with approval gates |
-| **Command Center** | KPIs, live pipeline, batch analytics |
-| **Strategy Lab** | Strategy list, generation, MQL5 download |
-| **Evolution Lab** | Genetic evolution controls and lineage |
-| **Agent Control Room** | All 16+ agents with animated graph |
-| **Portfolio Optimizer** | Best strategy mix |
-| **Risk Center** | Risk dashboard |
-| **Logs** | System log viewer |
-| **Settings** | MT5 config + environment |
-
----
-
-## Human Safety Controls
-
-MedXora AI operates under **full human oversight**. The agent never acts autonomously on critical steps.
-
-### Approval required before:
-| Action | Why |
-|--------|-----|
-| Start evolution | Genetic mutation changes strategy fundamentals |
-| Export MQL5 | Files used in real trading must be human-verified |
-| Mark strategy as champion | Formal designation requires human sign-off |
-| Override risk veto | Safety-critical; human must consciously override |
-
-### Safety statement:
-> MedXora AI does not auto-trade in this demo. It creates and validates strategy **research outputs** under human approval. All backtests in demo mode are mock/simulated.
-
----
-
-## Demo Mode
-
-Click **"⚡ Run Judge Demo"** on the Mission Control page.
-
-This automatically runs:
-1. Start mission
-2. Gemini creates 14-step plan
-3. Generate EMA+RSI strategy
-4. Risk validation
-5. MQL5 generation
-6. Mock backtest
-7. Fitness scoring
-8. Monte Carlo (1000 simulations)
-9. Genetic evolution (3 generations)
-10. MCP memory save + search
-11. Ensemble voting (16 agents)
-12. Champion selection
-13. MQL5 export
-14. Gemini final report
-
-All steps use mock data. No MT5 installation required. Total runtime: ~3 seconds.
-
----
 
 ## Tech Stack
 
-| Layer | Technology |
-|-------|-----------|
-| AI Reasoning | Google Gemini 1.5 Flash |
-| Backend API | Python 3.10+ · FastAPI · Uvicorn |
-| Database | SQLite via SQLAlchemy ORM |
-| MCP Memory | MongoDB Atlas (+ SQLite fallback) |
-| AI Agents | 16+ custom Python agents |
-| Trading Engine | MetaTrader 5 (optional, mock mode available) |
-| Frontend | React 18 · Vite · Recharts · Tailwind CSS |
-| Deployment | Google Cloud Run · Firebase Hosting |
+- Frontend: React, Vite, ESLint, Recharts
+- Backend: FastAPI, SQLAlchemy, Pydantic, Uvicorn
+- Data: SQLite, Pandas, PyArrow, NumPy
+- AI integrations: Gemini support plus saved API-key/local-model evaluation flow
+- Optional external systems: MetaTrader 5, MongoDB
 
----
-
-## API Endpoints
-
-### Mission Control
-```
-POST /api/mission/start                      Start a new Gemini-planned mission
-GET  /api/mission/list                       List all missions
-GET  /api/mission/{id}                       Mission detail + steps + reasoning trace
-POST /api/mission/{id}/advance               Execute next pending step
-POST /api/mission/{id}/approve-step          Human approve/reject a step
-POST /api/mission/{id}/pause                 Pause mission
-POST /api/mission/{id}/resume               Resume paused mission
-POST /api/mission/{id}/stop                  Stop mission permanently
-```
-
-### Agent Reasoning
-```
-POST /api/agent/plan                         Gemini plan preview (no DB save)
-GET  /api/agent/reasoning-trace/{id}         Full Gemini reasoning trace
-GET  /api/agent/tool-calls/{id}              All tool calls for a mission
-POST /api/agent/critique/{name}              Gemini strategy quality critique
-POST /api/agent/route-tool                   Gemini tool routing decision
-```
-
-### Strategy (existing + new)
-```
-GET  /api/strategy/generate                  Generate strategy JSON preview
-GET  /api/strategy/generate-mql5             Generate + save + write .mq5
-POST /api/strategy/generate-code             Save strategy + write .mq5
-POST /api/strategy/{name}/evolve             Run N-generation evolution
-POST /api/strategy/{name}/ai-analyze         Gemini analysis
-POST /api/strategy/{id}/export-mql5          Export with human approval + Gemini report
-GET  /api/strategy/{id}/lineage              Full evolution tree
-GET  /api/strategy/download/{name}           Download .mq5 file
-```
-
-### Validation
-```
-POST /api/validation/monte-carlo/{id}        Monte Carlo robustness test
-POST /api/validation/walk-forward/{id}       Walk-forward anti-overfitting test
-GET  /api/validation/report/{id}             All validation reports for strategy
-```
-
-### MCP (MongoDB)
-```
-POST /api/mcp/save-strategy-memory           Save to MongoDB memory
-POST /api/mcp/search-strategies              Search by Sharpe, drawdown, risk status
-POST /api/mcp/save-agent-log                 Save agent reasoning log
-POST /api/mcp/observe-mission                Record mission observation
-GET  /api/mcp/status                         MongoDB + fallback connection status
-```
-
-### Demo
-```
-POST /api/demo/run-judge-demo                One-click complete demo mission
-GET  /api/demo/status                        Demo mode safety status
-```
-
-### Existing Core
-```
-GET  /api/dashboard/stats                    KPI statistics
-GET  /api/health                             Service health check
-GET  /api/agents                             All agents list
-GET  /api/strategies                         All strategies
-GET  /api/backtest/results                   Recent backtest results
-POST /api/pipeline/final                     Full one-shot pipeline
-GET  /api/logs                               System logs
-```
-
----
-
-## Database Schema (New Tables)
-
-| Table | Purpose |
-|-------|---------|
-| `missions` | Mission records with Gemini plan and status |
-| `mission_steps` | Individual step execution records |
-| `agent_reasoning_logs` | Gemini reasoning at each step |
-| `human_approvals` | Human approve/reject audit trail |
-| `mcp_events` | All MCP interactions (save/search/log/observe) |
-| `strategy_memory` | Strategy metrics stored in local+MongoDB memory |
-| `validation_reports` | Monte Carlo + walk-forward validation results |
-| `exported_mql5_files` | Export audit with Gemini report attached |
-
----
-
-## Environment Variables
-
-```bash
-# Required for Gemini features
-GEMINI_API_KEY=your_gemini_api_key_here
-
-# Optional: MongoDB MCP (falls back to SQLite without this)
-MONGODB_URI=mongodb+srv://user:pass@cluster.mongodb.net/
-
-# Optional: MT5 integration (mock mode works without MT5)
-MT5_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
-MT5_DATA_DIR=
-MT5_TICK_DATA_PATH=
-
-# Frontend origin (default covers localhost dev)
-CORS_ALLOWED_ORIGINS=http://localhost:5173,http://127.0.0.1:5173
-```
-
----
-
-## How to Run Locally
+## Local Setup
 
 ### Prerequisites
+
 - Python 3.10+
 - Node.js 18+
-- Git
+- npm
 
-### Step 1 — Clone and install
-
-```bash
-git clone https://github.com/YOUR_USERNAME/medxora-ai.git
-cd medxora-ai
-```
-
-### Step 2 — Backend setup
+### Backend
 
 ```bash
 cd backend
 python -m venv venv
-
-# Windows
 venv\Scripts\activate
-# Mac/Linux
-source venv/bin/activate
-
 pip install -r requirements.txt
-```
-
-### Step 3 — Configure environment
-
-```bash
-# Copy and edit .env
-# Add your GEMINI_API_KEY (required for full AI features)
-# MONGODB_URI is optional — SQLite fallback is automatic
-```
-
-### Step 4 — Start backend
-
-```bash
+copy .env.example .env
 uvicorn main:app --reload
-# API: http://127.0.0.1:8000
-# Docs: http://127.0.0.1:8000/docs
 ```
 
-### Step 5 — Frontend setup
+Backend URLs:
 
-```bash
-cd ../frontend
-npm install
-npm run dev
-# Dashboard: http://localhost:5173
-```
+- API: `http://127.0.0.1:8000`
+- Docs: `http://127.0.0.1:8000/docs`
 
-### Step 6 — Run demo
-
-Open `http://localhost:5173`, click **Mission Control** in the sidebar, then click **⚡ Run Judge Demo**.
-
----
-
-## Google Cloud Deployment
-
-### Backend — Cloud Run
-
-```bash
-# Build container
-cd backend
-docker build -t medxora-backend .
-
-# Push to Artifact Registry
-docker tag medxora-backend gcr.io/YOUR_PROJECT/medxora-backend
-docker push gcr.io/YOUR_PROJECT/medxora-backend
-
-# Deploy
-gcloud run deploy medxora-backend \
-  --image gcr.io/YOUR_PROJECT/medxora-backend \
-  --platform managed \
-  --region us-central1 \
-  --set-env-vars GEMINI_API_KEY=your_key \
-  --allow-unauthenticated
-```
-
-### Frontend — Firebase Hosting
+### Frontend
 
 ```bash
 cd frontend
+npm install
+npm run dev
+```
+
+Frontend URL:
+
+- App: `http://localhost:5173`
+
+## Environment Variables
+
+From [backend/.env.example](backend/.env.example):
+
+- `GEMINI_API_KEY`
+- `MONGODB_URI`
+- `MT5_PATH`
+- `MT5_DATA_DIR`
+- `MT5_TICK_DATA_PATH`
+- `CORS_ALLOWED_ORIGINS`
+- optional `DATABASE_URL`
+
+## Useful Validation Commands
+
+### Frontend
+
+```bash
+cd frontend
+npm run lint
 npm run build
-
-npm install -g firebase-tools
-firebase login
-firebase init hosting
-firebase deploy
 ```
 
----
+### Backend
 
-## Project Structure
-
-```
-medxora-ai/
-├── backend/
-│   ├── main.py                    # All FastAPI endpoints
-│   ├── config.py                  # Environment + paths
-│   ├── database/
-│   │   ├── db.py                  # SQLAlchemy engine + session
-│   │   └── tables.py              # All ORM models
-│   ├── agents/                    # 16+ specialised AI agents
-│   │   ├── strategy_creator.py
-│   │   ├── risk_manager.py
-│   │   ├── backtest_analyst.py
-│   │   ├── evolution_agent.py
-│   │   ├── monte_carlo_agent.py
-│   │   ├── ensemble_voting_agent.py
-│   │   └── ... (16+ total)
-│   └── services/
-│       ├── gemini_service.py      # Existing Gemini analysis
-│       ├── gemini_planner.py      # NEW: Gemini reasoning brain
-│       ├── mission_service.py     # NEW: Mission orchestration
-│       ├── mcp_service.py         # NEW: MongoDB MCP integration
-│       ├── mql5_generator.py
-│       ├── evolution_engine.py
-│       └── ... (20+ total)
-├── frontend/
-│   └── src/
-│       ├── AgentGraphUI.jsx       # Main dashboard (all pages)
-│       └── api.js                 # Axios API client
-├── README.md
-├── LICENSE                        # MIT
-└── CLAUDE.md                      # AI assistant guide
+```bash
+cd backend
+python -m py_compile main.py
 ```
 
----
+## Notable Current Improvements
 
-## Screenshots
+Recent work in the current codebase includes:
 
-> *(Add screenshots of Mission Control, Gemini Reasoning Trace, Agent Control Room, Evolution Lab)*
+- Evolution requests now use a long-running frontend API client
+- Evolution results keep before/after comparison data more reliably
+- Evolved result metrics are preserved even when the saved child strategy is still sparse
+- Improved evaluation/integration logging flow
+- Logs page now has a usable save action for integration settings
+- Frontend lint issues were cleaned up and the build is passing again
 
----
+## Known Limitations
 
-## Demo Video
+These are the biggest current gaps based on the present codebase:
 
-> *(Add 3-minute demo video link here)*
+- There is no automated test suite in the project yet
+- There is no CI workflow configured yet
+- The frontend is still concentrated heavily in [frontend/src/AgentGraphUI.jsx](frontend/src/AgentGraphUI.jsx), which makes maintenance harder
+- The backend route layer is still concentrated heavily in [backend/main.py](backend/main.py)
+- Some workflows still rely on mock or seeded results rather than full real-trading validation
+- Authentication, user accounts, and role-based access are not implemented
+- Deployment is not productionized inside this repo yet
+- Observability is mostly app-level logs rather than a full monitoring stack
 
----
+## Remaining Work
 
-## Hosted Project
+### High Priority
 
-> *(Add hosted URL here — Firebase Hosting or Cloud Run)*
+- Split the large frontend dashboard into smaller page and component modules
+- Split backend route definitions out of `main.py` into focused routers
+- Add automated backend tests for strategy, backtest, mission, and evolution endpoints
+- Add frontend component and flow tests for Strategy Lab, Mission Control, and Evolution Lab
+- Add a CI pipeline that runs lint, build, and backend validation automatically
+- Harden the evolution/evaluation flow with clearer loading, failure, and retry states
 
----
+### Product Quality
 
-## Submission Details
+- Add richer comparison metrics in Evolution Lab such as Sharpe delta, trade-count delta, and validation score deltas
+- Improve Strategy Lab and Mission Control traceability between generated strategy, evaluations, validations, and exports
+- Add clearer persistence around saved evaluation history so prior runs can be reviewed later
+- Add better empty/error states across dashboard pages
 
-- **Hackathon:** Google Cloud Rapid Agent Hackathon
-- **Track:** Gemini + Google Cloud + MCP Partner Integration (MongoDB)
-- **Prize Pool:** $60,000
-- **Deadline:** June 11, 2026
-- **License:** MIT
+### Trading And Data
 
----
+- Strengthen real MT5 execution/backtest verification beyond mock/demo mode
+- Expand dataset diagnostics and data-quality reporting
+- Add more validation gates before champion/export decisions
+- Track whether a metric comes from mock data, parsed MT5 reports, or derived evaluation output
 
-## Safety and Responsible Use
+### Platform And Ops
 
-MedXora AI is a **research and validation tool**, not an automated trading bot.
+- Add deployment files and tested instructions for a production backend/frontend stack
+- Add database migration support
+- Add structured monitoring and alerting
+- Add safer secrets handling for deployment environments
 
-- No positions are opened or closed automatically
-- No broker connections are made during demos
-- All strategy exports require explicit human approval
-- Risk Manager and Monte Carlo agents provide hard-veto capability
-- All AI decisions include confidence scores and reasoning traces
-- Complete audit trail of every agent decision and human approval
+## Recommended Next Steps
 
-**Use responsibly. Past backtest performance does not guarantee future results.**
+If you want to move this project from prototype toward a stronger release, the best order is:
 
----
-
-## Contributing
-
-Contributions are welcome. Please open an issue first to discuss what you'd like to change.
-
----
+1. Add automated tests and CI
+2. Break up the large frontend and backend files
+3. Stabilize real MT5 and validation workflows
+4. Improve persistence and auditability of evaluations
+5. Add deployment and environment hardening
 
 ## License
 
-[MIT License](LICENSE) — Copyright (c) 2026 MedXora AI
+MIT

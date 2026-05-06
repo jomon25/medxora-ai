@@ -1,5 +1,7 @@
 import json
 
+from sqlalchemy.exc import PendingRollbackError
+
 from database.tables import PipelineCheckpoint
 
 
@@ -12,14 +14,25 @@ def record_checkpoint(
     message: str,
     payload: dict | None = None,
 ):
-    checkpoint = (
-        db.query(PipelineCheckpoint)
-        .filter(
-            PipelineCheckpoint.strategy_name == strategy_name,
-            PipelineCheckpoint.stage == stage,
+    try:
+        checkpoint = (
+            db.query(PipelineCheckpoint)
+            .filter(
+                PipelineCheckpoint.strategy_name == strategy_name,
+                PipelineCheckpoint.stage == stage,
+            )
+            .first()
         )
-        .first()
-    )
+    except PendingRollbackError:
+        db.rollback()
+        checkpoint = (
+            db.query(PipelineCheckpoint)
+            .filter(
+                PipelineCheckpoint.strategy_name == strategy_name,
+                PipelineCheckpoint.stage == stage,
+            )
+            .first()
+        )
 
     if checkpoint is None:
         checkpoint = PipelineCheckpoint(
@@ -35,8 +48,12 @@ def record_checkpoint(
         checkpoint.message = message
         checkpoint.payload_json = json.dumps(payload) if payload is not None else None
 
-    db.commit()
-    db.refresh(checkpoint)
+    try:
+        db.commit()
+        db.refresh(checkpoint)
+    except PendingRollbackError:
+        db.rollback()
+        raise
     return checkpoint
 
 

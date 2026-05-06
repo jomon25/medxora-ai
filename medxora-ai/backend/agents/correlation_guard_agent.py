@@ -23,10 +23,40 @@ def _fingerprint(strategy: dict) -> list[float]:
 
 
 def _cosine_sim(a: list[float], b: list[float]) -> float:
-    dot   = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b))
     mag_a = math.sqrt(sum(x * x for x in a))
     mag_b = math.sqrt(sum(x * x for x in b))
     return dot / (mag_a * mag_b) if mag_a > 0 and mag_b > 0 else 0.0
+
+
+def _pearson_corr(a: list[float], b: list[float]) -> float | None:
+    if len(a) < 3 or len(b) < 3:
+        return None
+    size = min(len(a), len(b))
+    xs = a[:size]
+    ys = b[:size]
+    mean_x = sum(xs) / size
+    mean_y = sum(ys) / size
+    num = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
+    den_x = math.sqrt(sum((x - mean_x) ** 2 for x in xs))
+    den_y = math.sqrt(sum((y - mean_y) ** 2 for y in ys))
+    if den_x == 0 or den_y == 0:
+        return None
+    return num / (den_x * den_y)
+
+
+def _metric_series(strategy: dict) -> list[float]:
+    if strategy.get("return_series"):
+        return [float(v) for v in strategy.get("return_series", []) if v is not None]
+
+    metrics = strategy.get("metrics_history") or []
+    series = []
+    for row in metrics:
+        net_profit = float(row.get("net_profit", 0) or 0)
+        monthly_profit = float(row.get("monthly_profit", 0) or 0)
+        profit_factor = float(row.get("profit_factor", 1.0) or 1.0)
+        series.append(round(net_profit * 0.001 + monthly_profit * 0.02 + profit_factor, 4))
+    return series
 
 
 def run_correlation_guard_agent(strategy: dict, existing_strategies: list[dict] | None = None) -> dict:
@@ -36,67 +66,81 @@ def run_correlation_guard_agent(strategy: dict, existing_strategies: list[dict] 
             "decision": "approve",
             "confidence": 0.75,
             "risk_level": "low",
-            "reason": "Portfolio is empty — no correlation risk. Strategy accepted as first entry.",
+            "reason": "Portfolio is empty, so there is no portfolio correlation risk yet.",
             "evidence": ["No existing strategies to compare against."],
             "data": {"max_correlation": 0.0, "correlations": [], "is_duplicate": False},
             "review_state": "Approved",
         }
 
     fp = _fingerprint(strategy)
+    candidate_series = _metric_series(strategy)
     stype = strategy.get("strategy_type", "")
-
     correlations = []
+
     for ex in existing_strategies:
         if ex.get("name") == strategy.get("name"):
             continue
-        sim = _cosine_sim(fp, _fingerprint(ex))
+
+        ex_series = _metric_series(ex)
+        return_corr = _pearson_corr(candidate_series, ex_series)
+        similarity = _cosine_sim(fp, _fingerprint(ex))
         same_type = ex.get("strategy_type") == stype
+
+        effective_corr = abs(return_corr) if return_corr is not None else similarity
+        method = "return_correlation" if return_corr is not None else "parameter_similarity"
         correlations.append({
             "name": ex.get("name", "unknown"),
-            "similarity": round(sim, 4),
+            "correlation": round(effective_corr, 4),
+            "raw_return_correlation": round(return_corr, 4) if return_corr is not None else None,
+            "parameter_similarity": round(similarity, 4),
             "same_type": same_type,
-            "is_duplicate": sim > 0.95 and same_type,
+            "method": method,
+            "is_duplicate": similarity > 0.95 and same_type,
         })
 
     if not correlations:
-        max_sim, is_duplicate = 0.0, False
+        max_corr, is_duplicate = 0.0, False
     else:
-        max_sim     = max(c["similarity"] for c in correlations)
+        max_corr = max(c["correlation"] for c in correlations)
         is_duplicate = any(c["is_duplicate"] for c in correlations)
 
-    high_corr = [c for c in correlations if c["similarity"] > 0.80]
-    top_match = sorted(correlations, key=lambda x: x["similarity"], reverse=True)
+    high_corr = [c for c in correlations if c["correlation"] > 0.60]
+    top_match = sorted(correlations, key=lambda x: x["correlation"], reverse=True)
+    using_return_corr = any(c["method"] == "return_correlation" for c in correlations)
 
     evidence = [
         f"Compared against {len(correlations)} portfolio strategies",
-        f"Max similarity score: {max_sim:.3f} (1.0 = identical)",
-        f"Highly correlated (>80%): {len(high_corr)} strategies",
+        f"Max effective correlation: {max_corr:.3f}",
+        f"High correlation breaches (>0.60): {len(high_corr)}",
+        f"Correlation method: {'actual return history when available, parameter fallback otherwise' if using_return_corr else 'parameter fallback only'}",
         f"Exact duplicate: {is_duplicate}",
     ]
     if top_match:
-        evidence.append(f"Most similar: '{top_match[0]['name']}' ({top_match[0]['similarity']*100:.1f}% similar)")
+        evidence.append(
+            f"Closest match: '{top_match[0]['name']}' at {top_match[0]['correlation']*100:.1f}% correlation"
+        )
 
-    if is_duplicate or max_sim > 0.95:
+    if is_duplicate or max_corr > 0.90:
         return {
             "agent": "Correlation Guard Agent",
             "decision": "reject",
             "confidence": 0.93,
             "risk_level": "high",
-            "reason": "Near-identical strategy already in portfolio. Adding it does not improve diversification.",
+            "reason": "This strategy is too correlated with an existing live candidate and adds little diversification value.",
             "evidence": evidence,
-            "data": {"max_correlation": round(max_sim, 4), "correlations": top_match[:5], "is_duplicate": True},
+            "data": {"max_correlation": round(max_corr, 4), "correlations": top_match[:5], "is_duplicate": True},
             "review_state": "Rejected",
         }
 
-    if max_sim > 0.80 or len(high_corr) >= 2:
-        decision, confidence, risk_level, review_state = "needs_evolution", 0.78, "medium", "Needs Evolution"
-        reason = f"High correlation ({max_sim:.0%}) with existing strategies. Evolution toward new parameters improves diversification."
-    elif max_sim > 0.65:
-        decision, confidence, risk_level, review_state = "needs_retest", 0.70, "medium", "Needs Retest"
-        reason = f"Moderate correlation ({max_sim:.0%}). Acceptable if performance profile is distinct."
+    if max_corr > 0.60 or len(high_corr) >= 2:
+        decision, confidence, risk_level, review_state = "needs_evolution", 0.80, "medium", "Needs Evolution"
+        reason = f"Portfolio correlation is above the 0.60 live threshold (max {max_corr:.0%}). Adjust parameters before admission."
+    elif max_corr > 0.45:
+        decision, confidence, risk_level, review_state = "needs_retest", 0.72, "medium", "Needs Retest"
+        reason = f"Correlation is moderate at {max_corr:.0%}. Retest with additional data before live deployment."
     else:
-        decision, confidence, risk_level, review_state = "approve", round(min(0.80 + (1.0 - max_sim) * 0.15, 0.95), 3), "low", "Approved"
-        reason = f"Strategy is sufficiently unique (max similarity {max_sim:.0%}). Good portfolio diversification."
+        decision, confidence, risk_level, review_state = "approve", round(min(0.80 + (1.0 - max_corr) * 0.15, 0.95), 3), "low", "Approved"
+        reason = f"Strategy remains diversified enough for the live portfolio (max correlation {max_corr:.0%})."
 
     return {
         "agent": "Correlation Guard Agent",
@@ -106,9 +150,10 @@ def run_correlation_guard_agent(strategy: dict, existing_strategies: list[dict] 
         "reason": reason,
         "evidence": evidence,
         "data": {
-            "max_correlation": round(max_sim, 4),
+            "max_correlation": round(max_corr, 4),
             "correlations": top_match[:5],
             "high_correlation_count": len(high_corr),
+            "used_return_correlation": using_return_corr,
             "is_duplicate": False,
         },
         "review_state": review_state,

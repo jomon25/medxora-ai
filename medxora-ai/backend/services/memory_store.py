@@ -12,6 +12,15 @@ def _dump(payload):
     return json.dumps(payload) if payload is not None else None
 
 
+def _load(payload_json):
+    if not payload_json:
+        return None
+    try:
+        return json.loads(payload_json)
+    except Exception:
+        return None
+
+
 def store_agent_memory(
     db,
     *,
@@ -34,6 +43,80 @@ def store_agent_memory(
     db.commit()
     db.refresh(row)
     return row
+
+
+def list_agent_memory(
+    db,
+    *,
+    agent_name: str | None = None,
+    strategy_name: str | None = None,
+    category: str | None = None,
+    limit: int = 20,
+):
+    query = db.query(AgentMemory)
+    if agent_name:
+        query = query.filter(AgentMemory.agent_name == agent_name)
+    if strategy_name:
+        query = query.filter(AgentMemory.strategy_name == strategy_name)
+    if category:
+        query = query.filter(AgentMemory.category == category)
+    return query.order_by(AgentMemory.created_at.desc()).limit(limit).all()
+
+
+def recall_similar_memories(
+    db,
+    *,
+    agent_name: str,
+    strategy: dict,
+    category: str = "decision",
+    limit: int = 5,
+):
+    params = strategy.get("parameters", {})
+    fast = float(params.get("fast_ema", 0) or 0)
+    slow = float(params.get("slow_ema", 0) or 0)
+    risk = float(params.get("risk_percent", 0) or 0)
+
+    candidates = list_agent_memory(
+        db,
+        agent_name=agent_name,
+        category=category,
+        limit=max(limit * 8, 20),
+    )
+
+    scored = []
+    for row in candidates:
+        payload = _load(row.payload_json) or {}
+        row_strategy = payload.get("strategy") or {}
+        row_params = row_strategy.get("parameters") or {}
+        if not row_params:
+            continue
+
+        row_fast = float(row_params.get("fast_ema", 0) or 0)
+        row_slow = float(row_params.get("slow_ema", 0) or 0)
+        row_risk = float(row_params.get("risk_percent", 0) or 0)
+        distance = (
+            abs(fast - row_fast) / 12.0
+            + abs(slow - row_slow) / 30.0
+            + abs(risk - row_risk) / 0.5
+        )
+
+        same_symbol = row_strategy.get("symbol") == strategy.get("symbol")
+        same_tf = row_strategy.get("timeframe") == strategy.get("timeframe")
+        if same_symbol:
+            distance -= 0.2
+        if same_tf:
+            distance -= 0.2
+
+        scored.append({
+            "row": row,
+            "payload": payload,
+            "distance": round(distance, 4),
+        })
+
+    return [
+        item
+        for item in sorted(scored, key=lambda x: x["distance"])[:limit]
+    ]
 
 
 def store_strategy_reflection(

@@ -1,84 +1,121 @@
 /**
- * api.js — Axios client for the MedXora AI backend
+ * api.js - Axios client for the MedXora AI backend
  *
- * Base URL: http://127.0.0.1:8000  (FastAPI, running via uvicorn)
+ * Local development:
+ * - default REST traffic uses the Vite proxy via relative "/api"
+ * - default websocket traffic uses the current browser host via "/ws/pipeline"
  *
- * All functions return an Axios response promise.
- * Caller receives: { data, status, headers, ... }
+ * Override with:
+ * - VITE_API_BASE_URL
+ * - VITE_PIPELINE_WS_URL
  */
 
 import axios from "axios";
 
 const localHosts = new Set(["localhost", "127.0.0.1"]);
-const browserOrigin = typeof window !== "undefined" ? window.location.origin : "";
-const defaultBaseUrl =
-  typeof window !== "undefined" && localHosts.has(window.location.hostname)
-    ? "http://127.0.0.1:8000"
-    : browserOrigin || "http://127.0.0.1:8000";
+const hasWindow = typeof window !== "undefined";
+const isLocalBrowser = hasWindow && localHosts.has(window.location.hostname);
 
-export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || defaultBaseUrl).replace(/\/$/, "");
-export const PIPELINE_WS_URL = API_BASE_URL.replace(/^http/, "ws") + "/ws/pipeline";
+const sanitizeUrl = (value) => String(value || "").replace(/\/$/, "");
 
-const api = axios.create({ baseURL: API_BASE_URL });
+const resolveApiBaseUrl = () => {
+  const configured = sanitizeUrl(import.meta.env.VITE_API_BASE_URL);
+  if (configured) return configured;
+  if (isLocalBrowser) return "";
+  return "http://127.0.0.1:8000";
+};
 
-// ── Phase 2: Strategy Generator ───────────────────────────────────────────────
-/** Generate a random strategy JSON preview (no DB save, no file written). */
+const resolvePipelineWsUrl = (apiBaseUrl) => {
+  const configured = sanitizeUrl(import.meta.env.VITE_PIPELINE_WS_URL);
+  if (configured) return configured;
+
+  if (apiBaseUrl) {
+    return `${apiBaseUrl.replace(/^http/, "ws")}/ws/pipeline`;
+  }
+
+  if (hasWindow) {
+    const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+    return `${protocol}://${window.location.host}/ws/pipeline`;
+  }
+
+  return "ws://127.0.0.1:8000/ws/pipeline";
+};
+
+export const API_BASE_URL = resolveApiBaseUrl();
+export const PIPELINE_WS_URL = resolvePipelineWsUrl(API_BASE_URL);
+
+const api = axios.create({
+  baseURL: API_BASE_URL || undefined,
+  timeout: 20000,
+  headers: {
+    Accept: "application/json",
+  },
+});
+
+const longRunningApi = axios.create({
+  baseURL: API_BASE_URL || undefined,
+  timeout: 0,
+  headers: {
+    Accept: "application/json",
+  },
+});
+
+const responseErrorHandler = (error) => {
+  const detail =
+    error?.response?.data?.detail ||
+    error?.response?.data?.message ||
+    error?.response?.data?.error ||
+    error?.message ||
+    "Request failed";
+
+  return Promise.reject(new Error(detail));
+};
+
+api.interceptors.response.use((response) => response, responseErrorHandler);
+longRunningApi.interceptors.response.use((response) => response, responseErrorHandler);
+
+// -- Phase 2: Strategy Generator -------------------------------------------------------
 export const generateStrategy = () => api.get("/api/strategy/generate");
 export const generateStrategyWithTimeframe = (timeframe) =>
   api.get("/api/strategy/generate", { params: { timeframe } });
 
-// ── Phase 3: MQL5 Code Generator ──────────────────────────────────────────────
-/** One-shot: generate strategy + write .mq5 + save to DB. */
+// -- Phase 3: MQL5 Code Generator ------------------------------------------------------
 export const generateMql5Pipeline = (timeframe = "M15") =>
   api.get("/api/strategy/generate-mql5", { params: { timeframe } });
-/** Save an existing strategy JSON to DB and write its .mq5 file. */
 export const generateCode = (strategy) => api.post("/api/strategy/generate-code", strategy);
-/** Download .mq5 file as a browser attachment. Returns a URL string (not a promise). */
-export const downloadMql5Url = (name) =>
-  `${API_BASE_URL}/api/strategy/download/${name}`;
+export const downloadMql5Url = (name) => `${API_BASE_URL}/api/strategy/download/${name}`;
 
-// ── Risk check ────────────────────────────────────────────────────────────────
+// -- Risk check ------------------------------------------------------------------------
 export const riskCheck = (strategy) => api.post("/api/strategy/risk-check", strategy);
 
-// ── Phase 5: MT5 Config Generator ─────────────────────────────────────────────
-/** Create MT5 tester .ini config for a saved strategy. */
+// -- Phase 5: MT5 Config Generator -----------------------------------------------------
 export const createBacktestConfig = (name, params = {}) =>
   api.get(`/api/backtest/create-config/${name}`, { params });
 
-// ── Phase 6: MT5 Auto Backtest Runner ─────────────────────────────────────────
-/** Launch MT5 and run a real backtest (requires MT5 installed). */
+// -- Phase 6: MT5 Auto Backtest Runner -------------------------------------------------
 export const runMt5Backtest = (name) => api.get(`/api/backtest/run/${name}`);
-/**
- * Run a mock or real backtest and save the result to the DB.
- * @param {string}  name  strategy name
- * @param {boolean} mock  true = instant seeded mock, false = real MT5 run
- */
 export const runBacktest = (name, mock = true) =>
   api.post(`/api/backtest/${name}?mock=${mock}`);
 
-// ── Phase 7: Backtest Report Parser ───────────────────────────────────────────
-/** Parse the latest MT5 HTML report for a strategy. */
+// -- Phase 7: Backtest Report Parser ---------------------------------------------------
 export const parseBacktestReport = (name) => api.get(`/api/backtest/parse/${name}`);
 
-// ── Phase 9: Strategy APIs ────────────────────────────────────────────────────
+// -- Phase 9: Strategy APIs ------------------------------------------------------------
 export const listStrategies = () => api.get("/api/strategies");
-export const getStrategy    = (id) => api.get(`/api/strategies/${id}`);
-/** Return only the MQL5 source code for a strategy. */
-export const getStrategyCode    = (id) => api.get(`/api/strategies/${id}/code`);
-/** Return all backtest results for a strategy. */
+export const getStrategy = (id) => api.get(`/api/strategies/${id}`);
+export const getStrategyCode = (id) => api.get(`/api/strategies/${id}/code`);
 export const getStrategyBacktest = (id) => api.get(`/api/strategies/${id}/backtest`);
 
-// ── Phase 10: Dashboard stats ─────────────────────────────────────────────────
+// -- Phase 10: Dashboard stats ---------------------------------------------------------
 export const getStats = () => api.get("/api/dashboard/stats");
 export const getHealth = () => api.get("/api/health");
-/** Most recent backtest results across all strategies. */
 export const listBacktests = () => api.get("/api/backtest/results");
+export const getDatasetStatus = () => api.get("/api/datasets/status");
+export const convertMT5EURUSD = () => longRunningApi.post("/api/datasets/convert-mt5-eurusd");
+export const generateEURUSDOHLCV = () => longRunningApi.post("/api/datasets/generate-ohlcv-eurusd");
+export const runEURUSDBacktest = (payload) => longRunningApi.post("/api/backtest/eurusd-demo", payload);
 
-// ── Phase 9: Full Pipeline ────────────────────────────────────────────────────
-/**
- * One-shot pipeline: generate strategy → .mq5 → backtest → save → return metrics.
- * @param {boolean} mock  true = instant mock (default), false = real MT5 run
- */
+// -- Phase 9: Full Pipeline ------------------------------------------------------------
 export const runPipeline = (mock = true, timeframe = "M15") =>
   api.post("/api/pipeline/create-and-backtest", null, { params: { mock, timeframe } });
 export const runLivePipeline = (mock = true, timeframe = "M15") =>
@@ -96,93 +133,98 @@ export const optimizeStrategyWinRate = (target = 70, generations = 5, batchSize 
 export const filterCheck = (payload) => api.post("/api/strategy/filter-check", payload);
 export const resumeLivePipeline = (name, mock = true) =>
   api.post(`/api/pipeline/live/resume/${name}`, null, { params: { mock } });
-export const getPipelineCheckpoints = (name) =>
-  api.get(`/api/pipeline/checkpoints/${name}`);
+export const getPipelineCheckpoints = (name) => api.get(`/api/pipeline/checkpoints/${name}`);
 
-// ── Phase 12: Evolution Engine ────────────────────────────────────────────────
+// -- Phase 12: Evolution Engine --------------------------------------------------------
 export const evolveStrategy = (name, generations = 3) =>
-  api.post(`/api/strategy/${name}/evolve?generations=${generations}`);
+  longRunningApi.post(`/api/strategy/${name}/evolve?generations=${generations}`);
 
-// ── Phase 13: AI Agents ───────────────────────────────────────────────────────
+// -- Phase 13: AI Agents ---------------------------------------------------------------
 export const listAgents = () => api.get("/api/agents");
 export const getAgentReview = (name) => api.get(`/api/strategy/${name}/agent-review`);
 export const getStrategyMemory = (name) => api.get(`/api/memory/strategy/${name}`);
 
-// ── Phase 14: Gemini AI Analyst ───────────────────────────────────────────────
+// -- Phase 14: Gemini AI Analyst -------------------------------------------------------
 export const aiAnalyze = (name) => api.post(`/api/strategy/${name}/ai-analyze`);
 
-// ── Phase 15: System Logs ─────────────────────────────────────────────────────
-/**
- * Fetch system log entries.
- * @param {number} limit  max entries (default 100)
- * @param {string} level  "INFO" | "WARN" | "ERROR" | "" (all)
- */
+// -- Phase 15: System Logs -------------------------------------------------------------
 export const getLogs = (limit = 100, level = "") =>
   api.get("/api/logs", { params: { limit, level } });
+export const getIntegrationSettings = () => api.get("/api/integrations/settings");
+export const saveIntegrationSettings = (payload) => api.post("/api/integrations/settings", payload);
 
-// ── Strategy Types ────────────────────────────────────────────────────────────
+// -- Strategy Types --------------------------------------------------------------------
 export const listStrategyTypes = () => api.get("/api/strategy/types");
 
-// ── Agent Stats / Leaderboard ─────────────────────────────────────────────────
+// -- Agent Stats / Leaderboard ---------------------------------------------------------
 export const getAgentStats = () => api.get("/api/agents/stats");
-export const getAllAgents   = () => api.get("/api/agents/all");
+export const getAllAgents = () => api.get("/api/agents/all");
 
-// ── Monte Carlo ───────────────────────────────────────────────────────────────
+// -- Monte Carlo -----------------------------------------------------------------------
 export const runMonteCarlo = (name, simulations = 1000) =>
   api.post(`/api/strategy/${name}/monte-carlo`, null, { params: { simulations } });
 export const getMonteCarloAgent = (name, simulations = 1000) =>
   api.get(`/api/strategy/${name}/monte-carlo`, { params: { simulations } });
 
-// ── Production Readiness ──────────────────────────────────────────────────────
+// -- Production Readiness --------------------------------------------------------------
 export const checkProductionReady = (name) =>
   api.get(`/api/strategy/${name}/production-ready`);
 
-// ── Full AI Research Pipeline ─────────────────────────────────────────────────
+// -- Full AI Research Pipeline ---------------------------------------------------------
 export const runFullResearchPipeline = (mock = true, timeframe = "M15", strategy_type = null) => {
   const params = { mock, timeframe };
   if (strategy_type) params.strategy_type = strategy_type;
   return api.post("/api/pipeline/full-research", null, { params });
 };
 
-// ── Portfolio Intelligence ────────────────────────────────────────────────────
+// -- Portfolio Intelligence ------------------------------------------------------------
 export const getPortfolioBestMix = (maxStrategies = 5, minProfit = 0, maxDrawdown = 30) =>
-  api.get("/api/portfolio/best-mix", { params: { max_strategies: maxStrategies, min_profit: minProfit, max_drawdown: maxDrawdown } });
+  api.get("/api/portfolio/best-mix", {
+    params: { max_strategies: maxStrategies, min_profit: minProfit, max_drawdown: maxDrawdown },
+  });
 export const getPortfolioRebalance = () => api.get("/api/portfolio/rebalance");
 
-// ── Risk Dashboard ────────────────────────────────────────────────────────────
+// -- Risk Dashboard --------------------------------------------------------------------
 export const getRiskDashboard = () => api.get("/api/risk/dashboard");
 
-// ── Orchestration ─────────────────────────────────────────────────────────────
+// -- Orchestration ---------------------------------------------------------------------
 export const orchestrateStrategy = (name, mock = true) =>
   api.post(`/api/strategy/${name}/orchestrate`, null, { params: { mock } });
 
-// ── Intelligence Agents (v2) ──────────────────────────────────────────────────
-export const getSentimentAgent   = (name) => api.get(`/api/strategy/${name}/sentiment`);
-export const getMacroAgent       = (name) => api.get(`/api/strategy/${name}/macro`);
+// -- Intelligence Agents (v2) ----------------------------------------------------------
+export const getSentimentAgent = (name) => api.get(`/api/strategy/${name}/sentiment`);
+export const getMacroAgent = (name) => api.get(`/api/strategy/${name}/macro`);
 export const getSeasonalityAgent = (name) => api.get(`/api/strategy/${name}/seasonality`);
 export const getDrawdownRecovery = (name) => api.get(`/api/strategy/${name}/drawdown-recovery`);
-export const getMultiSymbolCorr  = (name) => api.get(`/api/strategy/${name}/multi-symbol-correlation`);
-export const getRegimeChange     = (name) => api.get(`/api/strategy/${name}/regime-change`);
-export const getSlippageAgent    = (name) => api.get(`/api/strategy/${name}/slippage`);
-export const getRetirementCheck  = (name) => api.get(`/api/strategy/${name}/retirement-check`);
-export const getAlerts           = (name, profitTarget = 1000, maxDrawdown = 20) =>
-  api.get(`/api/strategy/${name}/alerts`, { params: { profit_target: profitTarget, max_drawdown_limit: maxDrawdown } });
-export const getBenchmarkAgent   = (name) => api.get(`/api/strategy/${name}/benchmark`);
+export const getMultiSymbolCorr = (name) => api.get(`/api/strategy/${name}/multi-symbol-correlation`);
+export const getRegimeChange = (name) => api.get(`/api/strategy/${name}/regime-change`);
+export const getSlippageAgent = (name) => api.get(`/api/strategy/${name}/slippage`);
+export const getRetirementCheck = (name) => api.get(`/api/strategy/${name}/retirement-check`);
+export const getAlerts = (name, profitTarget = 1000, maxDrawdown = 20) =>
+  api.get(`/api/strategy/${name}/alerts`, {
+    params: { profit_target: profitTarget, max_drawdown_limit: maxDrawdown },
+  });
+export const getBenchmarkAgent = (name) => api.get(`/api/strategy/${name}/benchmark`);
 export const getFullIntelligence = (name) => api.get(`/api/strategy/${name}/full-intelligence`);
 
-// ── Advanced Agent endpoints ──────────────────────────────────────────────────
-export const getRegimeAgent      = (name) => api.get(`/api/strategy/${name}/regime`);
-export const getOverfitAgent     = (name) => api.get(`/api/strategy/${name}/overfit`);
-export const getSessionsAgent    = (name) => api.get(`/api/strategy/${name}/sessions`);
-export const getAdaptiveRisk     = (name) => api.get(`/api/strategy/${name}/adaptive-risk`);
+// -- Advanced Agent endpoints ----------------------------------------------------------
+export const getRegimeAgent = (name) => api.get(`/api/strategy/${name}/regime`);
+export const getOverfitAgent = (name) => api.get(`/api/strategy/${name}/overfit`);
+export const getSessionsAgent = (name) => api.get(`/api/strategy/${name}/sessions`);
+export const getAdaptiveRisk = (name) => api.get(`/api/strategy/${name}/adaptive-risk`);
 export const getCorrelationAgent = (name) => api.get(`/api/strategy/${name}/correlation`);
+export const getDebateAgent = (name) => api.get(`/api/strategy/${name}/debate`);
+export const getMultiTimeframeAgent = (name) => api.get(`/api/strategy/${name}/multi-timeframe`);
+export const getNewsSentimentNlpAgent = (name) => api.get(`/api/strategy/${name}/news-sentiment-nlp`);
+export const getRegimeAdaptiveAgent = (name) => api.get(`/api/strategy/${name}/regime-adaptive`);
 
-// ── Compare strategies ────────────────────────────────────────────────────────
+// -- Compare strategies ----------------------------------------------------------------
 export const compareStrategies = (ids) =>
   Promise.all(ids.map((id) => api.get(`/api/strategies/${id}`)));
 
 export const getStrategies = listStrategies;
 export const getStrategyDetail = getStrategy;
+
 export function connectPipelineSocket(onMessage, onStatusChange) {
   const ws = new WebSocket(PIPELINE_WS_URL);
 
@@ -196,16 +238,16 @@ export function connectPipelineSocket(onMessage, onStatusChange) {
   return ws;
 }
 
-// ── Hackathon: Mission Control ────────────────────────────────────────────────
+// -- Hackathon: Mission Control --------------------------------------------------------
 export const startMission = (goal, pair = "EURUSD", timeframe = "M15") =>
-  api.post("/api/mission/start", { user_goal: goal, pair, timeframe });
+  longRunningApi.post("/api/mission/start", { user_goal: goal, pair, timeframe });
 export const listMissions = (limit = 20) => api.get("/api/mission/list", { params: { limit } });
 export const getMission = (id) => api.get(`/api/mission/${id}`);
-export const advanceMission = (id) => api.post(`/api/mission/${id}/advance`);
+export const advanceMission = (id) => longRunningApi.post(`/api/mission/${id}/advance`);
 export const approveStep = (missionId, stepId, approved, notes = "") =>
-  api.post(`/api/mission/${missionId}/approve-step`, { step_id: stepId, approved, notes });
+  longRunningApi.post(`/api/mission/${missionId}/approve-step`, { step_id: stepId, approved, notes });
 export const pauseMission = (id) => api.post(`/api/mission/${id}/pause`);
-export const resumeMission = (id) => api.post(`/api/mission/${id}/resume`);
+export const resumeMission = (id) => longRunningApi.post(`/api/mission/${id}/resume`);
 export const stopMission = (id) => api.post(`/api/mission/${id}/stop`);
 export const getReasoningTrace = (id) => api.get(`/api/agent/reasoning-trace/${id}`);
 export const agentPlan = (goal, pair = "EURUSD", timeframe = "M15") =>

@@ -33,7 +33,8 @@ class Strategy(Base):
     stop_loss    = Column(Integer)
     take_profit  = Column(Integer)
     risk_percent = Column(Float)
-    mql5_file    = Column(String, nullable=True)
+    mql5_file       = Column(String, nullable=True)
+    parameters_json = Column(Text, nullable=True)   # full strategy params serialized as JSON
     parent_id    = Column(Integer, ForeignKey("strategies.id"), nullable=True)
     generation   = Column(Integer, default=0)
     created_at   = Column(DateTime, default=lambda: datetime.now(timezone.utc))
@@ -41,24 +42,33 @@ class Strategy(Base):
     backtest_results = relationship("BacktestResult", back_populates="strategy")
 
     def as_dict(self) -> dict:
+        # Start with extended params from JSON blob (covers MACD, Ichimoku, Bollinger, etc.)
+        params: dict = {}
+        if self.parameters_json:
+            try:
+                params = json.loads(self.parameters_json)
+            except Exception:
+                pass
+        # Individual columns always win — they were the saved canonical values
+        params.update({
+            "fast_ema":     self.fast_ema,
+            "slow_ema":     self.slow_ema,
+            "rsi_period":   self.rsi_period,
+            "rsi_buy":      self.rsi_buy,
+            "rsi_sell":     self.rsi_sell,
+            "stop_loss":    self.stop_loss,
+            "take_profit":  self.take_profit,
+            "risk_percent": self.risk_percent,
+        })
         return {
-            "id":           self.id,
-            "name":         self.name,
-            "symbol":       self.symbol,
-            "timeframe":    self.timeframe,
+            "id":            self.id,
+            "name":          self.name,
+            "symbol":        self.symbol,
+            "timeframe":     self.timeframe,
             "strategy_type": self.type,
-            "generation":   self.generation,
-            "created_at":   self.created_at.isoformat() if self.created_at else None,
-            "parameters": {
-                "fast_ema":     self.fast_ema,
-                "slow_ema":     self.slow_ema,
-                "rsi_period":   self.rsi_period,
-                "rsi_buy":      self.rsi_buy,
-                "rsi_sell":     self.rsi_sell,
-                "stop_loss":    self.stop_loss,
-                "take_profit":  self.take_profit,
-                "risk_percent": self.risk_percent,
-            },
+            "generation":    self.generation,
+            "created_at":    self.created_at.isoformat() if self.created_at else None,
+            "parameters":    params,
         }
 
 
@@ -501,3 +511,87 @@ class ExportedMql5(Base):
                 "approved_by_human": str(self.approved_by_human).lower() == "true",
                 "gemini_report": self.gemini_report,
                 "created_at": self.created_at.isoformat() if self.created_at else None}
+
+
+class AgentCalibration(Base):
+    """Tracks prediction accuracy of each agent over time for dynamic weight adjustment."""
+    __tablename__ = "agent_calibration"
+
+    id            = Column(Integer, primary_key=True, index=True)
+    agent_name    = Column(String, index=True)
+    strategy_name = Column(String, index=True, nullable=True)
+    predicted_decision = Column(String)           # approve|reject|needs_retest|needs_evolution
+    actual_outcome     = Column(String, nullable=True)  # profitable|unprofitable|neutral (filled after 30d)
+    predicted_confidence = Column(Float, nullable=True)
+    was_correct   = Column(String, nullable=True)  # true|false|pending
+    calibration_score = Column(Float, nullable=True)  # rolling accuracy 0.0-1.0
+    created_at    = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    resolved_at   = Column(DateTime, nullable=True)
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "agent_name": self.agent_name,
+            "strategy_name": self.strategy_name,
+            "predicted_decision": self.predicted_decision,
+            "actual_outcome": self.actual_outcome,
+            "predicted_confidence": self.predicted_confidence,
+            "was_correct": self.was_correct,
+            "calibration_score": self.calibration_score,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "resolved_at": self.resolved_at.isoformat() if self.resolved_at else None,
+        }
+
+
+class DebateRecord(Base):
+    """Stores Bull vs Bear debate transcripts for strategy decisions."""
+    __tablename__ = "debate_records"
+
+    id             = Column(Integer, primary_key=True, index=True)
+    strategy_name  = Column(String, index=True)
+    bull_score     = Column(Float, nullable=True)
+    bear_score     = Column(Float, nullable=True)
+    rounds_json    = Column(Text, nullable=True)   # JSON list of round transcripts
+    final_verdict  = Column(String, nullable=True)  # bull_wins|bear_wins|draw
+    judge_summary  = Column(Text, nullable=True)
+    created_at     = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "strategy_name": self.strategy_name,
+            "bull_score": self.bull_score,
+            "bear_score": self.bear_score,
+            "rounds": json.loads(self.rounds_json) if self.rounds_json else [],
+            "final_verdict": self.final_verdict,
+            "judge_summary": self.judge_summary,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class WalkForwardResult(Base):
+    """Stores walk-forward optimization results for overfitting detection."""
+    __tablename__ = "walk_forward_results"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    strategy_id     = Column(Integer, ForeignKey("strategies.id"), index=True)
+    windows_json    = Column(Text, nullable=True)   # IS/OOS window results
+    consistency_score = Column(Float, nullable=True)  # 0-100: how consistent across windows
+    is_avg_profit   = Column(Float, nullable=True)
+    oos_avg_profit  = Column(Float, nullable=True)
+    degradation_pct = Column(Float, nullable=True)  # IS→OOS profit degradation
+    passed          = Column(String, default="false")
+    created_at      = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def as_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "strategy_id": self.strategy_id,
+            "windows": json.loads(self.windows_json) if self.windows_json else [],
+            "consistency_score": self.consistency_score,
+            "is_avg_profit": self.is_avg_profit,
+            "oos_avg_profit": self.oos_avg_profit,
+            "degradation_pct": self.degradation_pct,
+            "passed": str(self.passed).lower() == "true",
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
