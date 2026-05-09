@@ -50,6 +50,8 @@ CORS_ALLOWED_ORIGINS = _parse_csv_env(
         "http://127.0.0.1:5173",
         "http://localhost:4173",
         "http://127.0.0.1:4173",
+        "https://gen-lang-client-0419797096.web.app",
+        "https://gen-lang-client-0419797096.firebaseapp.com",
     ],
 )
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
