@@ -3037,3 +3037,572 @@ def demo_status():
         "live_trading": False,
         "message": "MedXora AI runs in safe demo mode. No live trading is performed. All backtests are mock/simulated.",
     }
+
+# -------------------------------
+# MongoDB Atlas Health + Memory API
+# -------------------------------
+
+from datetime import datetime
+from uuid import uuid4
+from typing import List
+from pydantic import BaseModel
+
+from database.mongodb import (
+    db,
+    init_mongodb_indexes,
+    agent_memory_collection,
+    strategies_collection,
+    agent_runs_collection,
+)
+
+
+@app.on_event("startup")
+async def mongodb_startup_event():
+    await init_mongodb_indexes()
+    print("MongoDB Atlas connected and indexes initialized")
+
+
+@app.get("/api/mongodb/health")
+async def mongodb_health():
+    try:
+        if db is None:
+            return {
+                "success": False,
+                "message": "MongoDB is not configured",
+                "database": "medxora_ai"
+            }
+
+        await db.command("ping")
+        return {
+            "success": True,
+            "message": "MongoDB Atlas connected successfully",
+            "database": "medxora_ai"
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "message": str(e)
+        }
+
+
+class AgentMemoryRequest(BaseModel):
+    memory_type: str = "strategy_learning"
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    content: str
+    tags: List[str] = []
+    importance: float = 0.5
+
+
+@app.post("/api/mongodb/agent-memory")
+async def create_agent_memory(req: AgentMemoryRequest):
+    memory = {
+        "memory_id": f"mem_{uuid4().hex[:12]}",
+        "memory_type": req.memory_type,
+        "symbol": req.symbol,
+        "timeframe": req.timeframe,
+        "content": req.content,
+        "tags": req.tags,
+        "importance": req.importance,
+        "created_at": datetime.utcnow().isoformat()
+    }
+
+    await agent_memory_collection.insert_one(memory)
+    memory.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Agent memory saved to MongoDB Atlas",
+        "memory": memory
+    }
+
+
+@app.get("/api/mongodb/agent-memory")
+async def list_agent_memory(limit: int = 20):
+    cursor = agent_memory_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    memories = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(memories),
+        "memories": memories
+    }
+
+
+@app.get("/api/mongodb/strategies")
+async def list_mongodb_strategies(limit: int = 20):
+    cursor = strategies_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    strategies = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(strategies),
+        "strategies": strategies
+    }
+
+
+@app.get("/api/mongodb/agent-runs")
+async def list_mongodb_agent_runs(limit: int = 20):
+    cursor = agent_runs_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    runs = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(runs),
+        "agent_runs": runs
+    }
+
+# -------------------------------
+# MongoDB Atlas Full Partner Track API
+# -------------------------------
+
+from typing import Any, Dict, Optional
+
+
+class MongoStrategyRequest(BaseModel):
+    name: str
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    strategy_type: str = "unknown"
+    status: str = "draft"
+    indicators: List[Dict[str, Any]] = []
+    entry_rules: List[str] = []
+    exit_rules: List[str] = []
+    risk_rules: List[str] = []
+    agent_source: str = "MedXora AI"
+    robustness_score: float = 0
+    version: int = 1
+    parent_strategy_id: Optional[str] = None
+
+
+@app.post("/api/mongodb/strategies")
+async def create_mongodb_strategy(req: MongoStrategyRequest):
+    strategy = {
+        "strategy_id": f"strat_{uuid4().hex[:12]}",
+        "name": req.name,
+        "symbol": req.symbol,
+        "timeframe": req.timeframe,
+        "strategy_type": req.strategy_type,
+        "status": req.status,
+        "indicators": req.indicators,
+        "entry_rules": req.entry_rules,
+        "exit_rules": req.exit_rules,
+        "risk_rules": req.risk_rules,
+        "agent_source": req.agent_source,
+        "robustness_score": req.robustness_score,
+        "version": req.version,
+        "parent_strategy_id": req.parent_strategy_id,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat(),
+    }
+
+    await strategies_collection.insert_one(strategy)
+    strategy.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Strategy saved to MongoDB Atlas",
+        "strategy": strategy
+    }
+
+
+class MongoBacktestRequest(BaseModel):
+    strategy_id: str
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    metrics: Dict[str, Any] = {}
+    equity_curve: List[Dict[str, Any]] = []
+    drawdown_curve: List[Dict[str, Any]] = []
+    daily_pnl: List[Dict[str, Any]] = []
+    monthly_returns: List[Dict[str, Any]] = []
+    trades: List[Dict[str, Any]] = []
+    validation: Dict[str, Any] = {}
+
+
+@app.post("/api/mongodb/backtests")
+async def create_mongodb_backtest(req: MongoBacktestRequest):
+    backtest = {
+        "backtest_id": f"bt_{uuid4().hex[:12]}",
+        "strategy_id": req.strategy_id,
+        "symbol": req.symbol,
+        "timeframe": req.timeframe,
+        "metrics": req.metrics,
+        "equity_curve": req.equity_curve,
+        "drawdown_curve": req.drawdown_curve,
+        "daily_pnl": req.daily_pnl,
+        "monthly_returns": req.monthly_returns,
+        "trades": req.trades,
+        "validation": req.validation,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    await backtests_collection.insert_one(backtest)
+    backtest.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Backtest result saved to MongoDB Atlas",
+        "backtest": backtest
+    }
+
+
+@app.get("/api/mongodb/backtests")
+async def list_mongodb_backtests(limit: int = 20):
+    cursor = backtests_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    backtests = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(backtests),
+        "backtests": backtests
+    }
+
+
+class MongoAgentRunRequest(BaseModel):
+    mission_id: Optional[str] = None
+    agent_name: str
+    input: Dict[str, Any] = {}
+    output: Dict[str, Any] = {}
+    status: str = "completed"
+    model: str = "gemini-or-system"
+    duration_ms: Optional[int] = None
+
+
+@app.post("/api/mongodb/agent-runs")
+async def create_mongodb_agent_run(req: MongoAgentRunRequest):
+    run = {
+        "run_id": f"run_{uuid4().hex[:12]}",
+        "mission_id": req.mission_id,
+        "agent_name": req.agent_name,
+        "input": req.input,
+        "output": req.output,
+        "status": req.status,
+        "model": req.model,
+        "duration_ms": req.duration_ms,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    await agent_runs_collection.insert_one(run)
+    run.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Agent run saved to MongoDB Atlas",
+        "agent_run": run
+    }
+
+
+from database.mongodb import (
+    backtests_collection,
+    risk_verdicts_collection,
+    mql5_exports_collection,
+    strategy_evolution_collection,
+)
+
+
+class MongoRiskVerdictRequest(BaseModel):
+    strategy_id: str
+    verdict: str = "NEEDS_REVIEW"
+    risk_score: float = 0
+    robustness_score: float = 0
+    max_drawdown: Optional[float] = None
+    sharpe: Optional[float] = None
+    profit_factor: Optional[float] = None
+    win_rate: Optional[float] = None
+    strengths: List[str] = []
+    risks: List[str] = []
+    rejection_reason: Optional[str] = None
+    improvement_plan: List[str] = []
+    judge_friendly_explanation: str = ""
+
+
+@app.post("/api/mongodb/risk-verdicts")
+async def create_mongodb_risk_verdict(req: MongoRiskVerdictRequest):
+    verdict = {
+        "risk_verdict_id": f"risk_{uuid4().hex[:12]}",
+        "strategy_id": req.strategy_id,
+        "verdict": req.verdict,
+        "risk_score": req.risk_score,
+        "robustness_score": req.robustness_score,
+        "max_drawdown": req.max_drawdown,
+        "sharpe": req.sharpe,
+        "profit_factor": req.profit_factor,
+        "win_rate": req.win_rate,
+        "strengths": req.strengths,
+        "risks": req.risks,
+        "rejection_reason": req.rejection_reason,
+        "improvement_plan": req.improvement_plan,
+        "judge_friendly_explanation": req.judge_friendly_explanation,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    await risk_verdicts_collection.insert_one(verdict)
+    verdict.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Risk verdict saved to MongoDB Atlas",
+        "risk_verdict": verdict
+    }
+
+
+@app.get("/api/mongodb/risk-verdicts")
+async def list_mongodb_risk_verdicts(limit: int = 20):
+    cursor = risk_verdicts_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    verdicts = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(verdicts),
+        "risk_verdicts": verdicts
+    }
+
+
+class MongoMQL5ExportRequest(BaseModel):
+    strategy_id: str
+    filename: str
+    code: str
+    compile_status: str = "not_compiled"
+    review: Dict[str, Any] = {}
+    notes: List[str] = []
+
+
+@app.post("/api/mongodb/mql5-exports")
+async def create_mongodb_mql5_export(req: MongoMQL5ExportRequest):
+    export = {
+        "export_id": f"mql5_{uuid4().hex[:12]}",
+        "strategy_id": req.strategy_id,
+        "filename": req.filename,
+        "code": req.code,
+        "compile_status": req.compile_status,
+        "review": req.review,
+        "notes": req.notes,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    await mql5_exports_collection.insert_one(export)
+    export.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "MQL5 export saved to MongoDB Atlas",
+        "mql5_export": export
+    }
+
+
+@app.get("/api/mongodb/mql5-exports")
+async def list_mongodb_mql5_exports(limit: int = 20):
+    cursor = mql5_exports_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    exports = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(exports),
+        "mql5_exports": exports
+    }
+
+
+class MongoStrategyEvolutionRequest(BaseModel):
+    parent_strategy_id: str
+    child_strategy_id: str
+    mutation_type: str = "parameter_mutation"
+    changed_fields: Dict[str, Any] = {}
+    reason: str = ""
+    before_metrics: Dict[str, Any] = {}
+    after_metrics: Dict[str, Any] = {}
+
+
+@app.post("/api/mongodb/strategy-evolution")
+async def create_mongodb_strategy_evolution(req: MongoStrategyEvolutionRequest):
+    evolution = {
+        "evolution_id": f"evo_{uuid4().hex[:12]}",
+        "parent_strategy_id": req.parent_strategy_id,
+        "child_strategy_id": req.child_strategy_id,
+        "mutation_type": req.mutation_type,
+        "changed_fields": req.changed_fields,
+        "reason": req.reason,
+        "before_metrics": req.before_metrics,
+        "after_metrics": req.after_metrics,
+        "created_at": datetime.utcnow().isoformat(),
+    }
+
+    await strategy_evolution_collection.insert_one(evolution)
+    evolution.pop("_id", None)
+
+    return {
+        "success": True,
+        "message": "Strategy evolution record saved to MongoDB Atlas",
+        "strategy_evolution": evolution
+    }
+
+
+@app.get("/api/mongodb/strategy-evolution")
+async def list_mongodb_strategy_evolution(limit: int = 20):
+    cursor = strategy_evolution_collection.find({}, {"_id": 0}).sort("created_at", -1).limit(limit)
+    evolutions = await cursor.to_list(length=limit)
+
+    return {
+        "success": True,
+        "count": len(evolutions),
+        "strategy_evolution": evolutions
+    }
+
+
+@app.get("/api/mongodb/summary")
+async def mongodb_summary():
+    agent_memory_count = await agent_memory_collection.count_documents({})
+    agent_runs_count = await agent_runs_collection.count_documents({})
+    strategies_count = await strategies_collection.count_documents({})
+    backtests_count = await backtests_collection.count_documents({})
+    risk_verdicts_count = await risk_verdicts_collection.count_documents({})
+    mql5_exports_count = await mql5_exports_collection.count_documents({})
+    strategy_evolution_count = await strategy_evolution_collection.count_documents({})
+
+    return {
+        "success": True,
+        "partner_track": "MongoDB",
+        "message": "MongoDB Atlas is the persistent memory layer for MedXora AI agents.",
+        "database": "medxora_ai",
+        "collections": {
+            "agent_memory": agent_memory_count,
+            "agent_runs": agent_runs_count,
+            "strategies": strategies_count,
+            "backtests": backtests_count,
+            "risk_verdicts": risk_verdicts_count,
+            "mql5_exports": mql5_exports_count,
+            "strategy_evolution": strategy_evolution_count
+        }
+    }
+
+# -------------------------------
+# Google AI Agent Mission Endpoint
+# -------------------------------
+
+from agents.google_agent_orchestrator import run_google_medxora_mission
+
+
+class GoogleAgentMissionRequest(BaseModel):
+    mission: str
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    risk_profile: str = "low"
+
+
+@app.post("/api/google-agents/run-mission")
+async def run_google_agent_mission(req: GoogleAgentMissionRequest):
+    result = await run_google_medxora_mission(
+        mission=req.mission,
+        symbol=req.symbol,
+        timeframe=req.timeframe,
+        risk_profile=req.risk_profile
+    )
+    return result
+
+# -------------------------------
+# MT5 EURUSD Tick Data Backtesting API
+# -------------------------------
+
+from services.mt5_backtest_service import run_and_save_mt5_backtest
+
+
+class MT5TickBacktestRequest(BaseModel):
+    file_path: str
+    timeframe: str = "5min"
+    max_rows: int = 100000
+
+
+@app.post("/api/backtest/mt5-eurusd-ticks")
+async def backtest_mt5_eurusd_ticks(req: MT5TickBacktestRequest):
+    result = await run_and_save_mt5_backtest(
+        file_path=req.file_path,
+        timeframe=req.timeframe,
+        max_rows=req.max_rows,
+    )
+
+    return {
+        "success": True,
+        "message": "MT5 EURUSD tick backtest completed and saved to MongoDB",
+        "result": result
+    }
+
+# -------------------------------
+# Safe MT5 Tick Backtest Endpoint
+# Avoids conflict with /api/backtest/{strategy_id}
+# -------------------------------
+
+from services.mt5_backtest_service import run_and_save_mt5_backtest
+
+
+class SafeMT5TickBacktestRequest(BaseModel):
+    file_path: str
+    timeframe: str = "5min"
+    max_rows: int = 100000
+
+
+@app.post("/api/mt5-tick-backtest/run")
+async def run_safe_mt5_tick_backtest(req: SafeMT5TickBacktestRequest):
+    result = await run_and_save_mt5_backtest(
+        file_path=req.file_path,
+        timeframe=req.timeframe,
+        max_rows=req.max_rows,
+    )
+
+    return {
+        "success": True,
+        "message": "MT5 EURUSD tick backtest completed and saved to MongoDB",
+        "result": result
+    }
+
+# -------------------------------
+# General Backend Health Endpoint
+# -------------------------------
+
+@app.get("/api/health")
+async def api_health():
+    return {
+        "success": True,
+        "status": "online",
+        "service": "MedXora FastAPI Backend",
+        "version": "2.0.0"
+    }
+
+# -------------------------------
+# MongoDB Strategy Detail Endpoint
+# -------------------------------
+
+@app.get("/api/mongodb/strategies/{strategy_id}")
+async def get_mongodb_strategy_detail(strategy_id: str):
+    strategy = await strategies_collection.find_one(
+        {"strategy_id": strategy_id},
+        {"_id": 0}
+    )
+
+    if not strategy:
+        return {
+            "success": False,
+            "message": "Strategy not found in MongoDB",
+            "strategy_id": strategy_id
+        }
+
+    backtests = await backtests_collection.find(
+        {"strategy_id": strategy_id},
+        {"_id": 0}
+    ).sort("created_at", -1).limit(10).to_list(length=10)
+
+    risk_verdicts = await risk_verdicts_collection.find(
+        {"strategy_id": strategy_id},
+        {"_id": 0}
+    ).sort("created_at", -1).limit(10).to_list(length=10)
+
+    mql5_exports = await mql5_exports_collection.find(
+        {"strategy_id": strategy_id},
+        {"_id": 0}
+    ).sort("created_at", -1).limit(10).to_list(length=10)
+
+    return {
+        "success": True,
+        "strategy": strategy,
+        "backtests": backtests,
+        "risk_verdicts": risk_verdicts,
+        "mql5_exports": mql5_exports
+    }

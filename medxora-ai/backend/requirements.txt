@@ -14,3 +14,8 @@ lxml
 python-dateutil
 websockets
 pymongo[srv]
+
+motor
+google-genai
+fsspec
+gcsfs

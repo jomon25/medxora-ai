@@ -102,7 +102,7 @@ export const parseBacktestReport = (name) => api.get(`/api/backtest/parse/${name
 
 // -- Phase 9: Strategy APIs ------------------------------------------------------------
 export const listStrategies = () => api.get("/api/strategies");
-export const getStrategy = (id) => api.get(`/api/strategies/${id}`);
+export const getStrategy = (id) => api.get(`/api/mongodb/strategies/${id}`);
 export const getStrategyCode = (id) => api.get(`/api/strategies/${id}/code`);
 export const getStrategyBacktest = (id) => api.get(`/api/strategies/${id}/backtest`);
 
@@ -220,7 +220,7 @@ export const getRegimeAdaptiveAgent = (name) => api.get(`/api/strategy/${name}/r
 
 // -- Compare strategies ----------------------------------------------------------------
 export const compareStrategies = (ids) =>
-  Promise.all(ids.map((id) => api.get(`/api/strategies/${id}`)));
+  Promise.all(ids.map((id) => api.get(`/api/mongodb/strategies/${id}`)));
 
 export const getStrategies = listStrategies;
 export const getStrategyDetail = getStrategy;
