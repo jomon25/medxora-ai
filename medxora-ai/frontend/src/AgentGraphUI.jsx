@@ -25,7 +25,7 @@ import {
 } from "./api";
 import {
   startMission, listMissions, getMission, advanceMission, approveStep,
-  pauseMission, resumeMission, stopMission, getMcpStatus,
+  pauseMission, resumeMission, stopMission, getMcpStatus, createMission, getMissionEvents, exportMQL5,
 } from "./api";
 
 const GOLD = "#c99a45";
@@ -2758,6 +2758,7 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
   const [actionLoading, setActionLoading] = useState("");
   const [mcpStatus, setMcpStatus] = useState(null);
   const [error, setError] = useState(null);
+  const [liveEvents, setLiveEvents] = useState([]);
   const activeMissionId = activeMission?.mission?.id || null;
   const activeMissionStatus = activeMission?.mission?.status || null;
 
@@ -2767,6 +2768,8 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
       const missionRes = await getMission(id);
       const missionPayload = missionRes.data;
       setActiveMission(missionPayload);
+      const eventsRes = await getMissionEvents(id).catch(() => ({ data: [] }));
+      setLiveEvents(Array.isArray(eventsRes.data) ? eventsRes.data : []);
       return missionPayload;
     } catch (fetchError) {
       setError(fetchError.message || "Failed to load mission details");
@@ -2871,13 +2874,22 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
         .filter(Boolean)
         .join(" ");
 
-      const res = await startMission(missionBrief, pair, missionTimeframe);
-      const mission = res.data?.mission;
-      if (!mission?.id) {
+      const res = await createMission({
+        mission: missionBrief,
+        symbol: pair,
+        timeframe: missionTimeframe,
+        max_drawdown: 15,
+        target_sharpe: 1.2,
+        min_trades: 50,
+        use_evolution: true,
+      }).catch(() => startMission(missionBrief, pair, missionTimeframe));
+      const mission = res.data?.mission || { id: res.data?.mission_id, status: res.data?.status };
+      if (!mission?.id && !res.data?.mission_id) {
         throw new Error("Mission did not start correctly");
       }
-      setActiveMission({ mission, steps: [], reasoning_trace: [] });
-      await refreshOverview({ targetMissionId: mission.id });
+      const missionId = mission.id || res.data?.mission_id;
+      setActiveMission({ mission: { ...mission, id: missionId }, steps: [], reasoning_trace: [] });
+      await refreshOverview({ targetMissionId: missionId });
       await advanceMissionUntilCheckpoint(mission.id);
       await refreshOverview({ targetMissionId: mission.id });
       await refreshDashboard?.();
@@ -3068,7 +3080,7 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
   return (
     <PageShell
       title="Mission Control"
-      subtitle="Create, run, and review strategy missions from one guided workspace."
+      subtitle="MedXora AI Command Center · Autonomous MT5 strategy research, validation, evolution, and MQL5 deployment."
       action={
         <button
           onClick={() => refreshOverview({ targetMissionId: missionData?.id })}
@@ -3095,7 +3107,7 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
 
       <div className="grid gap-6 xl:grid-cols-[minmax(0,1.25fr)_380px]">
         <ShellCard className="p-6">
-          <PanelHeader title="Start New Mission" action="guided setup" />
+          <PanelHeader title="MedXora AI Command Center" action="guided setup" />
           <h2 className="text-2xl font-black">Tell Mission Control what you want to build</h2>
           <p className="mt-2 max-w-3xl text-sm text-[#fff7e6]/52">
             Describe the kind of EURUSD strategy you want, then Mission Control will generate it, backtest it, improve it, and save the result for you.
@@ -3125,7 +3137,7 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
             onChange={(event) => setGoal(event.target.value)}
             rows={4}
             className="mt-5 w-full rounded-[24px] border border-[#f5b342]/14 bg-black/35 px-4 py-4 text-sm text-[#fff7e6] outline-none transition placeholder:text-[#fff7e6]/28 focus:border-[#f5b342]/35"
-            placeholder="Example: Create a low-risk EURUSD strategy on M15 with clear entries, real tick-data backtests, and a final export."
+            placeholder="Describe the strategy you want agents to build..."
           />
           <div className="mt-4 flex flex-wrap gap-2">
             {goalPresets.map((preset) => (
@@ -3146,8 +3158,11 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
               {["M1", "M5", "M15", "M30", "H1", "H4", "D1"].map((item) => <option key={item}>{item}</option>)}
             </select>
             <button onClick={handleStartMission} disabled={loading} className="rounded-xl bg-[#f5b342] px-5 py-3 text-sm font-black text-black transition hover:brightness-105 disabled:opacity-50">
-              {loading ? "Starting Mission..." : "Start Mission"}
+              {loading ? "Starting Mission..." : "Start Agent Mission"}
             </button>
+            <button onClick={handleStop} className="rounded-xl border border-red-400/20 bg-red-400/10 px-4 py-3 text-xs font-black text-red-300 transition hover:bg-red-400/16">Stop Mission</button>
+            <button onClick={async () => missionStrategy?.id && exportMQL5(missionStrategy.id)} className="rounded-xl border border-[#f5b342]/20 bg-[#f5b342]/10 px-4 py-3 text-xs font-black text-[#f5b342] transition hover:bg-[#f5b342]/16">Export Champion</button>
+            <button onClick={() => document.getElementById('mission-report')?.scrollIntoView({ behavior: 'smooth' })} className="rounded-xl border border-white/15 bg-white/5 px-4 py-3 text-xs font-black text-[#fff7e6] transition hover:bg-white/10">View Report</button>
           </div>
           {waitingStep && missionData ? (
             <div className="mt-4 rounded-[24px] border border-[#f5b342]/24 bg-[#f5b342]/10 p-5">
@@ -3330,6 +3345,17 @@ function MissionControlWorkspacePage({ refreshDashboard }) {
                 <p className="mt-3 text-sm leading-6 text-[#e5eefc]">{missionData.gemini_reasoning}</p>
               </div>
             ) : null}
+            <div className="mt-6 rounded-[24px] border border-[#f5b342]/12 bg-[#0b0906] p-5">
+              <div className="text-[10px] font-black uppercase tracking-[.2em] text-[#f5d18b]">Live Agent Timeline</div>
+              <div className="mt-3 space-y-2">
+                {(liveEvents.length ? liveEvents : [{ id: "sample", timestamp: new Date().toISOString(), agent: "Mission Planner Agent", event_type: "info", message: "No active mission events yet. Start Agent Mission to begin live timeline." }]).slice(-12).map((event) => (
+                  <div key={event.id} className="flex items-center justify-between gap-3 rounded-xl border border-white/10 bg-white/5 px-3 py-2">
+                    <div className="text-xs text-[#fff7e6]/80"><span className="font-black text-[#f5b342]">{event.agent || "Agent"}</span> · {event.message}</div>
+                    <div className="text-[10px] text-[#fff7e6]/45">{formatDateTime(event.timestamp)}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
 
             <div className="mt-6 rounded-[24px] border border-[#f5b342]/14 bg-[#0b0906] p-5">
               <div className="flex flex-wrap items-start justify-between gap-4">
