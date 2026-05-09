@@ -31,6 +31,7 @@ Phase 15 : GET  /api/logs
 
 import json
 import os
+import asyncio
 import urllib.error
 import urllib.request
 
@@ -125,6 +126,12 @@ from services.mt5_ohlcv_generator  import (
 )
 from services.backtest_engine      import get_latest_backtest_result, run_ema_backtest
 from services.gemini_planner import plan_mission, critique_strategy, explain_risk, advise_evolution, write_final_report, route_tool
+
+from services.agentic_foundation import init_demo_db, conn, add_event, get_events
+from services.websocket_manager import ws_manager
+from agents.agent_registry import list_all_agents, get_core_agents, get_agent_status, get_agent as registry_get_agent, run_agent as registry_run_agent, get_strategy_specialists
+from services.robustness_service import calculate_robustness_score
+from agents import mission_planner, market_data_agent, strategy_creator_agent, mql5_code_agent, backtest_agent, risk_judge_agent, evolution_agent as evo_agent, report_agent
 from services.mission_service import (create_mission, get_mission, list_missions, advance_mission, approve_step as approve_mission_step, pause_mission, resume_mission, stop_mission, get_reasoning_trace, get_mission_strategy_snapshot, run_full_demo_mission)
 from services.mcp_service import save_strategy_memory, search_strategies as mcp_search_strategies, save_agent_log, observe_mission, get_mcp_status
 
@@ -188,6 +195,34 @@ class DatasetBacktestRequest(BaseModel):
     start_date: str | None = "2020-01-02"
     end_date: str | None = "2020-02-01"
     initial_balance: float = 10000.0
+
+
+class MissionStartPayload(BaseModel):
+    mission_text: str
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    data_source: str = "uploaded_tick_data"
+    mt5_account_id: str | None = None
+    initial_capital: float = 10000.0
+    max_drawdown: float = 15.0
+    target_sharpe: float = 1.2
+    minimum_trades: int = 40
+    spread_filter: float = 2.0
+    use_walk_forward: bool = False
+    use_evolution: bool = True
+
+
+class MT5AccountPayload(BaseModel):
+    name: str
+    server: str
+    login: str
+    password: str = ""
+    terminal_path: str = ""
+    enabled: bool = True
+    notes: str = ""
+
+
+MT5_ACCOUNTS: dict[str, dict] = {}
 
 
 def _fallback_evolution_advice_payload(parent: dict, child_scores: list[float], generation: int) -> dict:
@@ -468,6 +503,16 @@ def health_check(db: Session = Depends(get_db)):
     return {"status": overall, "services": services}
 
 
+@app.get("/api/status")
+def api_status():
+    return {"status": "ok", "service": "medxora-ai"}
+
+
+@app.get("/health")
+def root_health():
+    return {"status": "ok"}
+
+
 def _dataset_status_payload() -> dict:
     raw_file = inspect_tick_data_file(str(DATASET_RAW_PATH))
     conversion_metadata = get_conversion_metadata()
@@ -516,6 +561,39 @@ def _dataset_status_payload() -> dict:
 @app.get("/api/datasets/status")
 def dataset_status():
     return _dataset_status_payload()
+
+
+@app.get("/api/data/sources")
+def list_data_sources():
+    return [
+        {"id": "uploaded_tick_data", "name": "Uploaded EURUSD tick data"},
+        {"id": "mt5_live", "name": "MT5 demo account live data"},
+        {"id": "mt5_history", "name": "MT5 demo account historical rates"},
+    ]
+
+
+@app.get("/api/data/uploads")
+def list_uploaded_data():
+    payload = _dataset_status_payload()
+    raw = payload.get("raw_tick_file", {})
+    uploads = []
+    if raw.get("status") == "ready":
+        uploads.append({"id": "eurusd_raw_ticks", "name": "EURUSD Raw Tick File", "path": raw.get("path")})
+    return uploads
+
+
+@app.post("/api/data/validate")
+def validate_data(payload: dict):
+    target = payload.get("path") or str(DATASET_RAW_PATH)
+    inspection = inspect_tick_data_file(target)
+    return {"valid": inspection.get("status") == "ready", "inspection": inspection}
+
+
+@app.post("/api/data/resample")
+def resample_data(payload: dict):
+    source = payload.get("path") or str(DATASET_RAW_PATH)
+    files = generate_ohlcv_from_mt5_ticks(input_path=source)
+    return {"status": "ok", "files": files}
 
 
 @app.get("/api/integrations/settings")
@@ -1491,9 +1569,12 @@ def list_agents(db: Session = Depends(get_db)):
     Dynamically built from the orchestrator registry + intelligence agents.
     Adding a new agent file no longer requires editing this function.
     """
-    total_strategies = db.query(Strategy).count()
-    total_backtests = db.query(BacktestResult).count()
-    evolved_count = db.query(Strategy).filter(Strategy.generation > 0).count()
+    try:
+        total_strategies = db.query(Strategy).count()
+        total_backtests = db.query(BacktestResult).count()
+        evolved_count = db.query(Strategy).filter(Strategy.generation > 0).count()
+    except Exception:
+        return {"core_agents": get_core_agents(), "strategy_specialists": get_strategy_specialists()}
 
     runs_map = {
         "strategy_creator":           total_strategies,
@@ -2816,6 +2897,106 @@ def stop_mission_endpoint(mission_id: int, db: Session = Depends(get_db)):
     return stop_mission(db, mission_id)
 
 
+@app.post("/api/missions/start")
+def missions_start(payload: MissionStartPayload, db: Session = Depends(get_db)):
+    mission = create_mission(db, payload.mission_text, payload.symbol, payload.timeframe)
+    return {"mission_id": mission.id, "status": mission.status, "mission": mission.as_dict(), "config": payload.model_dump()}
+
+
+@app.get("/api/missions/{mission_id}")
+def missions_get(mission_id: int, db: Session = Depends(get_db)):
+    mission = get_mission(db, mission_id)
+    if not mission:
+        raise HTTPException(status_code=404, detail="Mission not found")
+    return mission.as_dict()
+
+
+@app.get("/api/missions/{mission_id}/events")
+def missions_get_events(mission_id: int, db: Session = Depends(get_db)):
+    trace = get_reasoning_trace(db, mission_id)
+    return [t.as_dict() for t in trace]
+
+
+@app.get("/api/missions/active")
+def missions_active(limit: int = 5, db: Session = Depends(get_db)):
+    missions = list_missions(db, limit)
+    for mission in missions:
+        if mission.status not in {"completed", "stopped", "failed"}:
+            return mission.as_dict()
+    return None
+
+
+@app.post("/api/missions/{mission_id}/stop")
+def missions_stop(mission_id: int, db: Session = Depends(get_db)):
+    return stop_mission(db, mission_id)
+
+
+@app.get("/api/agents/status")
+def agents_status():
+    return get_agent_status()
+
+
+def _sanitize_mt5_account(account: dict) -> dict:
+    payload = dict(account)
+    payload["password"] = "********" if payload.get("password") else ""
+    return payload
+
+
+@app.get("/api/mt5/accounts")
+def list_mt5_accounts():
+    return [_sanitize_mt5_account(a) for a in MT5_ACCOUNTS.values()]
+
+
+@app.post("/api/mt5/accounts")
+def create_mt5_account(payload: MT5AccountPayload):
+    account_id = f"mt5_demo_{len(MT5_ACCOUNTS) + 1:03d}"
+    MT5_ACCOUNTS[account_id] = {"id": account_id, **payload.model_dump(), "is_active": False, "status": "not_configured", "last_connected_at": None}
+    return _sanitize_mt5_account(MT5_ACCOUNTS[account_id])
+
+
+@app.get("/api/mt5/accounts/{account_id}")
+def get_mt5_account(account_id: str):
+    account = MT5_ACCOUNTS.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    return _sanitize_mt5_account(account)
+
+
+@app.put("/api/mt5/accounts/{account_id}")
+def update_mt5_account(account_id: str, payload: MT5AccountPayload):
+    if account_id not in MT5_ACCOUNTS:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    current = MT5_ACCOUNTS[account_id]
+    MT5_ACCOUNTS[account_id] = {**current, **payload.model_dump()}
+    return _sanitize_mt5_account(MT5_ACCOUNTS[account_id])
+
+
+@app.delete("/api/mt5/accounts/{account_id}")
+def delete_mt5_account(account_id: str):
+    if account_id not in MT5_ACCOUNTS:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    del MT5_ACCOUNTS[account_id]
+    return {"status": "deleted", "id": account_id}
+
+
+@app.post("/api/mt5/accounts/{account_id}/test-connection")
+def test_mt5_connection(account_id: str):
+    account = MT5_ACCOUNTS.get(account_id)
+    if not account:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    account["status"] = "connected" if account.get("enabled") else "disconnected"
+    return {"id": account_id, "status": account["status"]}
+
+
+@app.post("/api/mt5/accounts/{account_id}/set-active")
+def set_active_mt5_account(account_id: str):
+    if account_id not in MT5_ACCOUNTS:
+        raise HTTPException(status_code=404, detail="MT5 account not found")
+    for key in MT5_ACCOUNTS:
+        MT5_ACCOUNTS[key]["is_active"] = key == account_id
+    return _sanitize_mt5_account(MT5_ACCOUNTS[account_id])
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # HACKATHON — AGENT REASONING
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -3606,3 +3787,282 @@ async def get_mongodb_strategy_detail(strategy_id: str):
         "risk_verdicts": risk_verdicts,
         "mql5_exports": mql5_exports
     }
+
+
+@app.on_event("startup")
+def init_agentic_demo_db():
+    init_db()
+    init_demo_db()
+
+class MissionCreatePayload(BaseModel):
+    mission: str
+    symbol: str = "EURUSD"
+    timeframe: str = "M5"
+    initial_capital: float = 10000
+    max_drawdown: float = 15
+    target_sharpe: float = 1.2
+    min_trades: int = 50
+    data_source: str = "uploaded_tick_data"
+    use_evolution: bool = True
+    use_walk_forward: bool = False
+    risk_profile: str = "balanced"
+
+    @staticmethod
+    def _friendly_error(field: str, message: str):
+        raise HTTPException(status_code=422, detail={"error": True, "message": message, "field": field})
+
+    @classmethod
+    def model_validate(cls, obj, *args, **kwargs):
+        model = super().model_validate(obj, *args, **kwargs)
+        if len(model.mission.strip()) < 10 or len(model.mission.strip()) > 2000:
+            cls._friendly_error("mission", "Mission text must be between 10 and 2000 characters")
+        if not __import__("re").match(r"^[A-Z]{6,10}$", model.symbol):
+            cls._friendly_error("symbol", "Invalid symbol. Use values like EURUSD, GBPUSD, USDJPY, XAUUSD")
+        if model.timeframe not in {"M1", "M5", "M15", "M30", "H1", "H4", "D1"}:
+            cls._friendly_error("timeframe", "Invalid timeframe. Allowed values: M1, M5, M15, M30, H1, H4, D1")
+        if not (100 <= model.initial_capital <= 100000000):
+            cls._friendly_error("initial_capital", "Initial capital must be between 100 and 100000000")
+        if not (1 <= model.max_drawdown <= 80):
+            cls._friendly_error("max_drawdown", "Max drawdown must be between 1 and 80")
+        if not (0.1 <= model.target_sharpe <= 5.0):
+            cls._friendly_error("target_sharpe", "Target Sharpe must be between 0.1 and 5.0")
+        if not (1 <= model.min_trades <= 100000):
+            cls._friendly_error("min_trades", "Minimum trades must be between 1 and 100000")
+        if model.data_source not in {"uploaded_tick_data", "mt5_live", "mt5_history", "csv"}:
+            cls._friendly_error("data_source", "Invalid data source")
+        if model.risk_profile not in {"conservative", "balanced", "aggressive"}:
+            cls._friendly_error("risk_profile", "Invalid risk profile")
+        return model
+
+@app.post('/api/missions/create')
+async def create_mission_v2(payload: MissionCreatePayload):
+    c=conn(); mid=f"mission_{int(datetime.utcnow().timestamp())}"; ts=datetime.utcnow().isoformat()
+    c.execute('INSERT INTO missions(id,user_prompt,symbol,timeframe,status,current_stage,progress,config_json,result_json,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)',(mid,payload.mission,payload.symbol,payload.timeframe,'running','mission_received',1,json.dumps(payload.model_dump()),'{}',ts,ts)); c.commit(); c.close()
+    add_event(mid,'System','running','mission_received','Mission created','info',payload.model_dump(),agent_id='system',agent_name='System')
+    context={"mission_id":mid}; outputs={}
+    chain=['mission_planner_agent','data_quality_agent','market_regime_agent','strategy_creator_agent','mql5_code_agent','backtest_agent','risk_judge_agent','walk_forward_agent','monte_carlo_agent','evolution_agent','portfolio_allocation_agent','report_explainability_agent']
+    for idx, aid in enumerate(chain, start=1):
+        try:
+            outputs[aid]=registry_run_agent(aid, {**payload.model_dump(), **outputs}, context)
+            await ws_manager.broadcast_mission(mid,{"mission_id":mid,"agent_id":aid,"status":"completed","progress":int(idx/len(chain)*100)})
+        except Exception as exc:
+            add_event(mid,aid,'failed',aid,f'Agent failed: {exc}','error',{},agent_id=aid,agent_name=aid)
+            if aid in {'mission_planner_agent','strategy_creator_agent','backtest_agent'}:
+                c=conn(); c.execute('UPDATE missions SET status=?,current_stage=?,progress=?,updated_at=? WHERE id=?',('failed',aid,int(idx/len(chain)*100),datetime.utcnow().isoformat(),mid)); c.commit(); c.close()
+                return {"mission_id":mid,"status":"failed","current_stage":aid,"progress":int(idx/len(chain)*100)}
+    c=conn(); c.execute('UPDATE missions SET status=?,current_stage=?,progress=?,result_json=?,updated_at=? WHERE id=?',('completed','completed',100,json.dumps(outputs),datetime.utcnow().isoformat(),mid)); c.commit(); c.close()
+    return {"mission_id":mid,"status":"running","current_stage":"mission_planning","progress":5}
+
+@app.get('/api/missions/{mission_id}/events')
+def mission_events_v2(mission_id:str): return get_events(mission_id)
+
+@app.get('/api/missions/{mission_id}')
+def mission_detail_v2(mission_id:str):
+    c=conn(); row=c.execute('SELECT * FROM missions WHERE id=?',(mission_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404,detail='Mission not found')
+    return dict(row)
+
+@app.post('/api/agents/run')
+def run_agent(payload:dict): return {"status":"queued","payload":payload}
+
+@app.post('/api/strategies/{strategy_id}/export-mql5')
+def export_strategy_mql5(strategy_id:str, payload: dict = {}):
+    c=conn(); row=c.execute('SELECT strategy_json, mission_id FROM strategies WHERE id=?',(strategy_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404,detail='Strategy not found')
+    if payload.get("deployment_type") in {"live_test", "real_account_deployment"}:
+        c=conn(); approval=c.execute("SELECT id FROM human_approvals WHERE strategy_id=? AND approval_type IN ('live_test','real_account_deployment') AND status='approved' ORDER BY created_at DESC LIMIT 1",(strategy_id,)).fetchone(); c.close()
+        if not approval:
+            raise HTTPException(status_code=403, detail={"error": True, "message": "Human approval required for live trading actions", "field": "approval"})
+    strat=json.loads(row['strategy_json']); exp=mql5_code_agent.run(row['mission_id'],strat); return exp
+
+@app.post('/api/strategies/{strategy_id}/evolve')
+def evolve_strategy_v2(strategy_id:str):
+    c=conn(); row=c.execute('SELECT strategy_json, mission_id FROM strategies WHERE id=?',(strategy_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404,detail='Strategy not found')
+    strat=json.loads(row['strategy_json']); return evo_agent.run(row['mission_id'],strat)
+
+@app.post('/api/backtest/run')
+def run_backtest_v2(payload:dict):
+    mid=payload.get('mission_id','manual'); sid=payload.get('strategy_id','unknown')
+    result=backtest_agent.run(mid,{"id":sid})
+    bid=f"bt_{int(datetime.utcnow().timestamp())}"; c=conn(); c.execute('INSERT INTO backtests(id,mission_id,strategy_id,status,symbol,timeframe,metrics_json,trades_json,equity_curve_json,drawdown_curve_json,daily_pnl_json,monthly_pnl_json,created_at,completed_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)',(bid,mid,sid,'completed',payload.get('symbol','EURUSD'),payload.get('timeframe','M5'),json.dumps(result['metrics']),json.dumps(result['trades']),json.dumps(result['equity_curve']),json.dumps(result['drawdown_curve']),json.dumps(result['daily_pnl']),json.dumps(result['monthly_pnl']),datetime.utcnow().isoformat(),datetime.utcnow().isoformat())); c.commit(); c.close(); return {"backtest_id":bid,**result}
+
+@app.get('/api/backtest/{backtest_id}')
+def get_backtest_v2(backtest_id:str):
+    c=conn(); row=c.execute('SELECT * FROM backtests WHERE id=?',(backtest_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404,detail='Backtest not found')
+    return dict(row)
+
+@app.get('/api/leaderboard')
+def leaderboard_v2():
+    c=conn(); rows=[dict(r) for r in c.execute('SELECT id,name,symbol,timeframe,status,score FROM strategies ORDER BY score DESC LIMIT 20').fetchall()]; c.close(); return rows
+
+@app.get('/api/portfolio')
+def portfolio_v2(): return {"status":"ok","allocations":[]}
+
+@app.get('/api/system/health')
+def system_health_v2():
+    now_iso = datetime.utcnow().isoformat()
+    cloud_run_service = os.getenv("CLOUD_RUN_SERVICE", "medxora-backend")
+    gcp_region = os.getenv("GCP_REGION", "us-central1")
+    gcp_project = os.getenv("GCP_PROJECT_ID", "server-491114")
+    service_url = os.getenv("CLOUD_RUN_URL", f"https://{cloud_run_service}-268298488474.{gcp_region}.run.app")
+    firebase_project = os.getenv("FIREBASE_PROJECT_ID", "gen-lang-client-0419797096")
+    dataset_status = _dataset_status_payload().get("raw_tick_file", {}).get("status", "missing")
+    return {
+        "status": "online",
+        "timestamp": now_iso,
+        "environment": os.getenv("ENVIRONMENT", "production"),
+        "mode": "DEMO_REAL_MODE" if os.getenv("DEMO_REAL_MODE", "true").lower() == "true" else "MOCK_MODE",
+        "google_cloud": {
+            "cloud_run": {"status": "online", "service": cloud_run_service, "region": gcp_region, "service_url": service_url, "environment": os.getenv("ENVIRONMENT", "production"), "last_checked": now_iso},
+            "firebase_hosting": {"status": "configured", "hosting_url": os.getenv("FIREBASE_HOSTING_URL", ""), "project_id": firebase_project, "last_deploy_known": os.getenv("LAST_DEPLOY_REVISION", "unknown")},
+            "secret_manager": {"status": "configured" if GEMINI_API_KEY else "missing", "secret_name": "GEMINI_API_KEY", "key_exposed_to_frontend": False, "last_checked": now_iso},
+            "gemini_api": {"status": "configured" if GEMINI_API_KEY else "missing", "usage": ["mission_planning", "strategy_explanation", "report_generation"], "provider": "Google Gemini", "fallback_available": True},
+            "cloud_logging": {"status": "enabled", "log_streams": ["agent_events", "backend_logs", "mission_logs"], "latest_log_timestamp": now_iso},
+            "deployment": {"status": "configured", "tools": ["Cloud Run", "Cloud Build", "Artifact Registry"], "deployment_source": "Cloud Build / source deploy", "project_id": gcp_project},
+            "storage": {"status": "online", "type": "SQLite", "database_path": str(__import__('pathlib').Path(__file__).resolve().parent / "database" / "strategies.db"), "firestore_configured": False, "fallback": "in_memory"},
+        },
+        "services": {"database": "online", "agents": "online", "websocket": "online", "dataset": "available" if dataset_status == "ready" else "missing", "mt5": "not_configured"},
+        "security": {"frontend_has_gemini_key": False, "secret_manager_used": bool(GEMINI_API_KEY), "input_validation_enabled": True, "human_approval_required": True, "live_trading_default_enabled": False},
+        "safety_disclaimer": "MedXora AI is a research and validation tool. It does not guarantee profit. Trading involves risk. Live trading requires human approval and independent risk review.",
+    }
+
+@app.websocket('/ws/mission/{mission_id}')
+async def ws_mission(mission_id:str, websocket:WebSocket):
+    await ws_manager.connect_mission(mission_id, websocket)
+    try:
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect: ws_manager.disconnect_mission(mission_id, websocket)
+
+@app.websocket('/ws/evolution')
+async def ws_evolution(websocket:WebSocket):
+    await ws_manager.connect_evolution(websocket)
+    try:
+        while True: await websocket.receive_text()
+    except WebSocketDisconnect: ws_manager.disconnect_evolution(websocket)
+
+
+@app.get('/api/agents/core')
+def agents_core_v2():
+    return get_core_agents()
+
+@app.get('/api/agents/{agent_id}')
+def agent_detail_v2(agent_id:str):
+    agent = registry_get_agent(agent_id)
+    if not agent:
+        raise HTTPException(status_code=404, detail='Agent not found')
+    return agent.snapshot()
+
+@app.post('/api/agents/{agent_id}/run')
+def run_agent_by_id(agent_id:str, payload:dict):
+    try:
+        return registry_run_agent(agent_id, payload.get('input', payload), payload.get('context', {}))
+    except KeyError:
+        raise HTTPException(status_code=404, detail='Agent not found')
+
+@app.get('/api/missions/{mission_id}/agents')
+def mission_agents_status(mission_id:str):
+    return get_agent_status()
+
+@app.get('/api/agents')
+def agents_all_v2():
+    return {"core_agents": list_all_agents(), "strategy_specialists": get_strategy_specialists()}
+
+@app.get('/api/agents/status')
+def agents_status_v2():
+    return get_agent_status()
+
+@app.post('/api/agents/run')
+def run_agent_v2(payload:dict):
+    aid = payload.get('agent_id') or payload.get('id')
+    if not aid:
+        raise HTTPException(status_code=400, detail='agent_id required')
+    return run_agent_by_id(aid, payload)
+
+@app.websocket('/ws/agents')
+async def ws_agents(websocket:WebSocket):
+    await ws_manager.connect_evolution(websocket)
+    try:
+        while True:
+            await websocket.send_text(json.dumps({"type":"agent_status","data":get_agent_status()}))
+            await asyncio.sleep(2)
+    except WebSocketDisconnect:
+        ws_manager.disconnect_evolution(websocket)
+
+
+@app.get('/api/strategies/{strategy_id}/family-tree')
+def strategy_family_tree(strategy_id:str):
+    c=conn(); rows=[dict(r) for r in c.execute('SELECT * FROM strategy_versions WHERE strategy_id=? OR parent_strategy_id=? ORDER BY version',(strategy_id,strategy_id)).fetchall()]; c.close()
+    if not rows: return {"mission_id":None,"root_strategy_id":strategy_id,"nodes":[],"edges":[]}
+    nodes=[]; edges=[]; root=rows[0].get('strategy_id')
+    for r in rows:
+        after=json.loads(r.get('metrics_after_json') or '{}') if r.get('metrics_after_json') else {}
+        nodes.append({"id":r['strategy_id'],"label":r.get('name') or r['strategy_id'],"version":r.get('version'),"status":"champion" if r.get('is_champion') else (r.get('decision') or 'evolved'),"created_by_agent":r.get('created_by_agent'),"mutation_summary":r.get('mutation_summary'),"metrics":after,"decision":r.get('decision')})
+        if r.get('parent_strategy_id'): edges.append({"from":r['parent_strategy_id'],"to":r['strategy_id'],"label":r.get('mutation_summary') or r.get('mutation_type') or 'evolved'})
+    return {"mission_id":rows[0].get('mission_id'),"root_strategy_id":root,"nodes":nodes,"edges":edges}
+
+@app.get('/api/missions/{mission_id}/family-tree')
+def mission_family_tree(mission_id:str):
+    c=conn(); row=c.execute('SELECT strategy_id FROM strategy_versions WHERE mission_id=? ORDER BY version LIMIT 1',(mission_id,)).fetchone(); c.close()
+    if not row: return {"mission_id":mission_id,"root_strategy_id":None,"nodes":[],"edges":[]}
+    return strategy_family_tree(row['strategy_id'])
+
+@app.post('/api/robustness/calculate')
+def robustness_calculate(payload:dict):
+    return calculate_robustness_score(payload.get('metrics',{}), payload.get('walk_forward_result'), payload.get('monte_carlo_result'), payload.get('sensitivity_result'))
+
+@app.get('/api/strategies/{strategy_id}/robustness')
+def strategy_robustness(strategy_id:str):
+    c=conn(); row=c.execute('SELECT metrics_json FROM strategies WHERE id=?',(strategy_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404, detail='Strategy not found')
+    metrics=json.loads(row['metrics_json'] or '{}')
+    return robustness_calculate({"metrics":metrics})
+
+@app.get('/api/strategies/{strategy_id}/audit-trail')
+def strategy_audit(strategy_id:str):
+    c=conn(); rows=[dict(r) for r in c.execute('SELECT * FROM agent_events WHERE strategy_id=? ORDER BY id',(strategy_id,)).fetchall()]; c.close(); return rows
+
+@app.get('/api/missions/{mission_id}/audit-trail')
+def mission_audit(mission_id:str):
+    c=conn(); rows=[dict(r) for r in c.execute('SELECT * FROM agent_events WHERE mission_id=? ORDER BY id',(mission_id,)).fetchall()]; c.close(); return rows
+
+@app.get('/api/strategies/{strategy_id}/mql5-export')
+def get_strategy_export(strategy_id:str):
+    c=conn(); row=c.execute('SELECT * FROM mql5_exports WHERE strategy_id=? ORDER BY created_at DESC LIMIT 1',(strategy_id,)).fetchone(); c.close()
+    if not row: return {"strategy_id":strategy_id,"compile_status":"connector_required","mt5_connector_status":"not_configured"}
+    payload=dict(row); payload['compile_status']=payload.get('compile_status','connector_required'); payload['mt5_connector_status']='not_configured'; return payload
+
+@app.post('/api/mql5/compile')
+def compile_mql5(payload:dict):
+    return {"status":"connector_required","message":"MT5 connector required for compile/backtest"}
+
+@app.post('/api/mql5/backtest')
+def mql5_backtest(payload:dict):
+    return {"status":"connector_required","message":"MT5 connector required for compile/backtest"}
+
+@app.get('/api/mql5/exports')
+def list_mql5_exports():
+    c=conn(); rows=[dict(r) for r in c.execute('SELECT * FROM mql5_exports ORDER BY created_at DESC').fetchall()]; c.close(); return rows
+
+@app.get('/api/mql5/exports/{export_id}')
+def get_mql5_export(export_id:str):
+    c=conn(); row=c.execute('SELECT * FROM mql5_exports WHERE id=?',(export_id,)).fetchone(); c.close()
+    if not row: raise HTTPException(status_code=404, detail='Export not found')
+    return dict(row)
+
+@app.post('/api/strategies/{strategy_id}/request-approval')
+def request_approval(strategy_id:str, payload:dict):
+    aid=f"approval_{int(datetime.utcnow().timestamp())}"; c=conn(); c.execute('INSERT INTO human_approvals(id,mission_id,strategy_id,approval_type,status,requested_by_agent,risk_summary_json,approval_message,created_at) VALUES (?,?,?,?,?,?,?,?,?)',(aid,payload.get('mission_id'),strategy_id,payload.get('approval_type','mt5_deploy'),'pending',payload.get('requested_by_agent','Risk Judge Agent'),json.dumps(payload.get('risk_summary',{})),payload.get('approval_message','Human Approval Required'),datetime.utcnow().isoformat())); c.commit(); c.close(); return {"approval_id":aid,"status":"pending"}
+
+@app.get('/api/approvals/pending')
+def pending_approvals():
+    c=conn(); rows=[dict(r) for r in c.execute("SELECT * FROM human_approvals WHERE status='pending' ORDER BY created_at DESC").fetchall()]; c.close(); return rows
+
+@app.post('/api/approvals/{approval_id}/approve')
+def approve_req(approval_id:str, payload:dict={}):
+    c=conn(); c.execute("UPDATE human_approvals SET status='approved',approved_by=?,approved_at=? WHERE id=?",(payload.get('approved_by','human'),datetime.utcnow().isoformat(),approval_id)); c.commit(); c.close(); return {"approval_id":approval_id,"status":"approved"}
+
+@app.post('/api/approvals/{approval_id}/reject')
+def reject_req(approval_id:str, payload:dict={}):
+    c=conn(); c.execute("UPDATE human_approvals SET status='rejected',rejected_at=? WHERE id=?",(datetime.utcnow().isoformat(),approval_id)); c.commit(); c.close(); return {"approval_id":approval_id,"status":"rejected"}

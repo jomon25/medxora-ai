@@ -102,7 +102,7 @@ export const parseBacktestReport = (name) => api.get(`/api/backtest/parse/${name
 
 // -- Phase 9: Strategy APIs ------------------------------------------------------------
 export const listStrategies = () => api.get("/api/strategies");
-export const getStrategy = (id) => api.get(`/api/mongodb/strategies/${id}`);
+export const getStrategy = (id) => api.get(`/api/strategies/${id}`);
 export const getStrategyCode = (id) => api.get(`/api/strategies/${id}/code`);
 export const getStrategyBacktest = (id) => api.get(`/api/strategies/${id}/backtest`);
 
@@ -220,7 +220,7 @@ export const getRegimeAdaptiveAgent = (name) => api.get(`/api/strategy/${name}/r
 
 // -- Compare strategies ----------------------------------------------------------------
 export const compareStrategies = (ids) =>
-  Promise.all(ids.map((id) => api.get(`/api/mongodb/strategies/${id}`)));
+  Promise.all(ids.map((id) => api.get(`/api/strategies/${id}`)));
 
 export const getStrategies = listStrategies;
 export const getStrategyDetail = getStrategy;
@@ -258,6 +258,21 @@ export const getMcpStatus = () => api.get("/api/mcp/status");
 export const searchStrategiesMcp = (query) => api.post("/api/mcp/search-strategies", query);
 export const runMonteCarloValidation = (strategyId) =>
   api.post(`/api/validation/monte-carlo/${strategyId}`);
+
+// -- v2 unified APIs ------------------------------------------------------------------
+export const getActiveMission = () => api.get("/api/missions/active");
+export const getMissionEvents = (missionId) => api.get(`/api/missions/${missionId}/events`);
+export const getAgentsStatus = () => api.get("/api/agents/status");
+export const getDataSources = () => api.get("/api/data/sources");
+export const getUploadedDatasets = () => api.get("/api/data/uploads");
+export const validateDataset = (payload) => api.post("/api/data/validate", payload);
+export const resampleDataset = (payload) => api.post("/api/data/resample", payload);
+export const getMT5Accounts = () => api.get("/api/mt5/accounts");
+export const addMT5Account = (payload) => api.post("/api/mt5/accounts", payload);
+export const updateMT5Account = (accountId, payload) => api.put(`/api/mt5/accounts/${accountId}`, payload);
+export const deleteMT5Account = (accountId) => api.delete(`/api/mt5/accounts/${accountId}`);
+export const testMT5Connection = (accountId) => api.post(`/api/mt5/accounts/${accountId}/test-connection`);
+export const setActiveMT5Account = (accountId) => api.post(`/api/mt5/accounts/${accountId}/set-active`);
 export const runWalkForwardValidation = (strategyId) =>
   api.post(`/api/validation/walk-forward/${strategyId}`);
 export const getValidationReports = (strategyId) =>
@@ -268,3 +283,35 @@ export const exportMql5WithApproval = (strategyId, missionId = null) =>
   api.post(`/api/strategy/${strategyId}/export-mql5`, null, missionId ? { params: { mission_id: missionId } } : {});
 export const geminiCritiqueStrategy = (name) =>
   api.post(`/api/agent/critique/${name}`);
+
+// -- Agentic foundation endpoints ------------------------------------------------------
+export const createMission = (payload) => longRunningApi.post('/api/missions/create', payload);
+export const getAgents = () => api.get('/api/agents');
+export const runAgent = (payload) => api.post('/api/agents/run', payload);
+export const exportMQL5 = (strategyId) => api.post(`/api/strategies/${strategyId}/export-mql5`);
+export const runBacktestV2 = (payload) => api.post('/api/backtest/run', payload);
+export const getBacktest = (backtestId) => api.get(`/api/backtest/${backtestId}`);
+export const getLeaderboard = () => api.get('/api/leaderboard');
+export const getPortfolio = () => api.get('/api/portfolio');
+export const getSystemHealth = () => api.get('/api/system/health');
+export const getCoreAgents = () => api.get('/api/agents/core');
+export const getAgent = (agentId) => api.get(`/api/agents/${agentId}`);
+export const runAgentById = (agentId, payload) => api.post(`/api/agents/${agentId}/run`, payload);
+export const getMissionAgents = (missionId) => api.get(`/api/missions/${missionId}/agents`);
+export const getStrategyFamilyTree = (strategyId) => api.get(`/api/strategies/${strategyId}/family-tree`);
+export const getMissionFamilyTree = (missionId) => api.get(`/api/missions/${missionId}/family-tree`);
+export const getStrategyRobustness = (strategyId) => api.get(`/api/strategies/${strategyId}/robustness`);
+export const calculateRobustness = (payload) => api.post('/api/robustness/calculate', payload);
+export const getStrategyAuditTrail = (strategyId) => api.get(`/api/strategies/${strategyId}/audit-trail`);
+export const getMissionAuditTrail = (missionId) => api.get(`/api/missions/${missionId}/audit-trail`);
+export const getMQL5Export = (strategyId) => api.get(`/api/strategies/${strategyId}/mql5-export`);
+export const compileMQL5 = (payload) => api.post('/api/mql5/compile', payload);
+export const runMQL5Backtest = (payload) => api.post('/api/mql5/backtest', payload);
+export const getMQL5Exports = () => api.get('/api/mql5/exports');
+export const getMQL5ExportById = (exportId) => api.get(`/api/mql5/exports/${exportId}`);
+export const requestStrategyApproval = (strategyId, payload) => api.post(`/api/strategies/${strategyId}/request-approval`, payload);
+export const getPendingApprovals = () => api.get('/api/approvals/pending');
+export const approveRequest = (approvalId, payload={}) => api.post(`/api/approvals/${approvalId}/approve`, payload);
+export const rejectRequest = (approvalId, payload={}) => api.post(`/api/approvals/${approvalId}/reject`, payload);
+
+export const getApiStatus = () => api.get('/api/status');
